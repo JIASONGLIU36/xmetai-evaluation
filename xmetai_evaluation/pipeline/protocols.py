@@ -1774,7 +1774,7 @@ class TyphoonTrackEnsProtocol(TyphoonTrackProtocol):
                 "集合台风：%d/%d 个成员失败，已从聚合里剔除（%s）",
                 len(self.failed_members),
                 len(self.members_found),
-                "、".join(sorted(self.failed_members)[:5]),
+                "、".join(str(name) for name in sorted(self.failed_members)[:5]),
             )
 
     def _build_batch_ens(

@@ -632,6 +632,10 @@ def _writer_typhoon_cases(tables, context, output_dir: Path) -> Path:
         matched = [
             k for k in range(len(leads)) if _is_finite(_at(curve, "track_err_km", k))
         ]
+        # init_pos 取**链的种子位置**（首个能配上时效的实况，通常为首个 +6h；
+        # 种子取的时刻由下面的 ``seed`` 字段标注）。首时次 at/ct 的定向基准另有
+        # 一条"起报时刻实况"（ob0，见 ``TrackErrorEns``）——旧 ens 归档把
+        # init_pos 也写成 ob0，是已知的记录级差异，经确认暂不追平（2026-09-30）。
         meta = {
             "tcid": tcid,
             "tcname": tcname,
