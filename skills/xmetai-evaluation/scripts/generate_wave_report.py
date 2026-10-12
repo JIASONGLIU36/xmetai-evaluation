@@ -21,6 +21,8 @@
 
     --result DIR       报告输出目录（必给，不存在会建）
     --archive TEXT  归档名，写进报告抬头与附录的「归档文件」
+    --own-dates     每个模型按自己的全部起报日统计（默认只用共同日期）。
+                    各模型覆盖时段差很多时用它；配对检验永远只在共同日期上做
 
 **与 `_single` 支线的差别**：纬向谱 log-RMS 这里用 **ln**（骨架 §2.1 的定义），
 `generate_det_report.py` 用 **log10**，两者差 ×2.3026，不要互相对数。
@@ -79,6 +81,13 @@ def main(argv=None) -> int:
     parser.add_argument("--result", type=Path, required=True, help="报告输出目录")
     parser.add_argument("--archive", default=None,
                         help="归档名，写进报告抬头与附录的「归档文件」")
+    parser.add_argument(
+        "--own-dates", action="store_true",
+        help="每个模型按**自己的全部起报日**统计，而不是只用共同日期。各模型覆盖时段"
+        "差很多时用它，免得为了对齐把长的那几份砍到最短的那份。配对检验（§4.3 与"
+        "§2 那两句）不受影响，它永远只在共同日期上做。不给就是老口径："
+        "全部统计只用共同日期",
+    )
     args = parser.parse_args(argv)
 
     models = []
@@ -98,7 +107,9 @@ def main(argv=None) -> int:
     from xmetai_evaluation.visualization.wave_report import build_wave_report
 
     archives = [load_archive(name, directory) for name, directory in models]
-    artifacts = build_wave_report(archives, args.result, archive=args.archive)
+    artifacts = build_wave_report(
+        archives, args.result, archive=args.archive, own_dates=args.own_dates,
+    )
 
     print(f"\n产出 {len(artifacts)} 个文件：")
     for name, path in artifacts.items():

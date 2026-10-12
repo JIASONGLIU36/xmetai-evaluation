@@ -176,7 +176,7 @@ weather_rmse_single_fgvp    ← RMSE 批次家族
 | 目录下是 `{编号}_24h/{起报日}/` 与 `{编号}_total/` 两套段，每段内含 `manifest.json` + `diagnostics/` | **暴雨过程个例**（双口径） | `generate_rainstorm_report.py` → `rainstorm_case.md`。**看着像 TS 但别喂给 `generate_report.py`**：单段的 `pipeline` 确实是 `weather_ts_det`，喂进去能跑，出的却是"一次连续时段"的章节口径 |
 | 13 列 TS 表 + `mode: deterministic`（或 `n_members: 1`） | **确定性 TS** | `weather_ts_det` → `weather_ts_single.md` |
 | 同一套表 + `mode: ensemble` / `n_members > 1` | **集合 TS** | `weather_ts_ens` → `weather_ts_ens.md` |
-| 同上，且 `aroc_windows` 非空、目录里有 `*aroc_bss*.csv` | **概率评分也有** | 集合骨架的第六节终于有数据了（见 `precipitation-evaluation.md` §2.1） |
+| 同上，且目录（或 `--compare` 那一份的同目录）里有概率表 `diagnostics/probability_wide.csv`，或老命名的 `aroc_bss*.csv` | **概率评分也有** | 集合骨架的第六节终于有数据了（见 `precipitation-evaluation.md` §2.1）。**看的是表在不在（认列不认名），不是看 `aroc_windows` 配没配**——表才是渲染器的输入 |
 | `scores.csv`（长表）+ `manifest.json` + `diagnostics/`，`resolved_config.pipeline` 是 `weather_field_scores` | **RMSE 批次家族**（连续场） | 按支线选入口：`_single`→`generate_det_report.py`、`_ens`→`generate_ens_report.py`、`_wave`→`generate_wave_report.py`，见 `rmse-batch-evaluation.md`。**想出一份单模型的连续场报告**走 `generate_report.py`（吃同样形状，只吃一份） |
 | `_meta.json` 里有 `babj` / `tcid` / `forecast_type` | **台风路径** | `forecast_type: "det"` → `weather_typhoon_single.md`；`"ens"` → `weather_typhoon_ens.md`（**渲染器都还没做**，见下） |
 | 一堆积分清单一（`mni_csv` 那种） | **结构演示/假数据** | 用户没点名就别当结果用 |
@@ -441,6 +441,9 @@ report/<模型>_<批次>/
 
 **集合那份（`weather_ts_ens`）在第五、六节之间多一节**「概率评分（AROC / BSS）」，
 后面的章节号整体后移一位（A 到八、B/C 到九），图与表也各多一个号。
+**这一节在拿得到概率表时才出现**（主模型目录、以及每个 `--compare` 的同目录里找
+`diagnostics/probability_wide.csv`，找不到再找老命名的 `aroc_bss*.csv`），
+两份都没有就整节消失、后面的号**自己收回来**——渲染器按实际出现的节现算，不写死章号。
 
 **TS 系列没有"图表索引"节**——图都就地带着图注出现，再列一遍只是重复。
 （连续场反过来：图集中在末尾的「图表」节，正文里不重复出现。）
@@ -637,17 +640,37 @@ REPORT.md
   改了渲染器的章节结构就必须同步改骨架，否则测试红。
 - **已知缺口**（写在这里免得下次重新发现）：
   1. 主模型入口认不得 `outputs/results/<目录>/` 的扁平布局（见工作流第 4 步）；
-  2. **集合报告出不出来，取决于数据而不取决于渲染器**：`generate_ens_report.py`
-     要求各模型有 ≥2 天共同日期，否则点名报错。实测三份集合归档
-     （FuXi 20250102–20251216 / AIFS 20250702–20250728 / FGVP 20250102–20250103）
-     **三方交集为 0**，目前只能出 FuXi↔AIFS 那份（27 天，低于 30 天样本下限，
-     报告自己会标「方向性参考」）；
-  3. 概率评分（AROC / BSS）取数与绘图那一层还没做，`weather_ts_ens_prob` 标着 `[BLOCKED]`；
+  2. **集合报告的日期口径有两档，选错就是两种数**：`generate_ens_report.py`
+     默认要求各模型有 ≥2 天共同日期，否则点名报错；加 `--own-dates` 则**每个模型
+     按自己的全部起报日统计**，只在第 6 节的配对检验上退回共同日期。
+     各模型覆盖时段差很多时必须用后者，否则为了对齐会把长的那几份砍到最短那份
+     （实测一批五模型：AIFS 27 / FGVP 228 / FGVP_old 348 / FuXi 349 / S2B 29 天，
+     共同日期只有 26 天，低于 30 天样本下限，报告自己会标「方向性参考」）。
+     `--own-dates` 的代价是**同表各列来自不同时段、不是公平对比**——渲染器会在
+     §1、§2、§4、§7、附录首段各点一次名，并在 §2 表里单列「本次使用日期」，
+     读的人能一眼看出谁被砍了多少。骨架
+     [`weather_rmse_ens.md`](./assets/templates/weather_rmse_ens.md) 顶部那张表
+     列全了两种口径下**逐字**差在哪几处；
+  3. **概率评分（AROC / BSS）的渲染器已经有了**：`ts_report.py` 读
+     `diagnostics/probability_wide.csv` 出集合骨架的第六节（表 + 图 + 小结），
+     报告侧的 `report.py` 会在主模型和每个 `--compare` 的**同目录**找这张表
+     （先找 `probability_wide.csv`，找不到再找老命名的 `aroc_bss*.csv`——
+     `weather_ts_ens_aifs` 那种「两张裸 CSV 并排放」的归档就是后者），
+     找到就一起进表、找不到就那份只出 TS（实测三份 v2 集合归档都有新命名的表；
+     `ts_multi_*` 两张都没有）。
+     **那种老归档里没有 manifest 也没有 meta，所以它的评测时段无从查起**——
+     报告第一节的时段披露要人工补，折算出来的天数只能当提示（`_probe_ts` 那份就是）。
+     集合成员数**产物里没有任何字段记着**（长表里那个数是算出来的，不是运行参数），
+     只能 `--members N` 从命令行给，不给就渲染成「—」；
   4. 球谐带功率**已经有渲染器**（`wave_report` 的 §4.1–4.3），数据取自长表里
      `spherical_bands` 展开的三行，靠 **`group` 列**区分频带。
-     但**现存归档的 `scores.csv` 缺 `group` 这一列**（契约 24 列、实拍 23 列），
-     5 个频带的行混在一起认不出来，这三节会走 `SPHERICAL_ABSENT` 标「本批未出」
-     ——**重跑评测即可**，不是报告端的问题。见 `references/rmse-batch-evaluation.md` §5.6；
+     这一块**要求参赛的每一份产物都有 `spherical_bands` 行**（`probe_bands` 是
+     `all(...)`），少一份就整块走 `SPHERICAL_ABSENT` 标「本批未出」——
+     **混合批次最容易踩这个**：实测五模型那批里只有 v2 出的 FGVP / SPW 有球谐带行，
+     三份中间层转过来的归档没有，于是三节全空。要么补齐那几份的评测，要么
+     接受「本批未出」。见 `references/rmse-batch-evaluation.md` §5.6；
+     **`_wave` 支线的日期口径也有 `--own-dates` 两档**（同 §3 缺口 2 的说明）：
+     谱统计按各模型全部起报日，配对检验永远退回共同日期；
   5. **台风两份骨架的渲染器还没做**（`weather_typhoon_single` / `_ens`）。
      而且 `weather_typhoon_ens.md` 里的列名**全部是从 `core/tc_ref.py` 的集合分支
      读出来的，不是实拍**——第一次真跑之后要拿真实表头回来核一遍；

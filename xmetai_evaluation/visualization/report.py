@@ -65,6 +65,10 @@ _FALLBACK_RULES = (
 
 CATEGORICAL_WIDE_RELATIVE_PATH = Path("diagnostics") / "categorical_wide.csv"
 
+#: 集合产物的概率评分宽表（``weather_ts_ens_prob`` 那一段写出）。确定性产物没有
+#: 这个文件，对比模型旁边也未必有——两处都是**有就用、没有就跳过**，不是错误。
+PROBABILITY_WIDE_RELATIVE_PATH = Path("diagnostics") / "probability_wide.csv"
+
 
 def parse_compare_specs(specs: Optional[Sequence[str]]) -> Dict[str, Path]:
     """把 ``["FuXi=a.csv", "AIFS=b.csv"]`` 解析成 ``{名字: 路径}``。
@@ -154,6 +158,7 @@ def build_report(
     spectrum_init: Optional[str] = None,
     change_description: Optional[str] = None,
     compare: Optional[Sequence[str]] = None,
+    members: Optional[int] = None,
 ) -> Dict[str, Path]:
     """按产物目录里的能力出图并写报告，返回 ``{名称: 路径}``。
 
@@ -166,7 +171,14 @@ def build_report(
             ``forecast_source``**——那是 reader 类型（如 ``"fuxi"``），不是模型名，
             拿它当标题会张冠李戴。
         compare: 对比模型，``["名字=CSV路径", …]``，只在 TS 系列上有意义。
-            给出来的模型会和主模型一起进箱线图、差值图和对比表。
+            给出来的模型会和主模型一起进箱线图、差值图和对比表。每个对比路径还会
+            去**它的同目录**找概率评分表——``probability_wide.csv`` 与老命名的
+            ``aroc_bss*.csv`` 都认（见 :func:`_probability_sibling`）；找得到就
+            一起进概率评分一节，找不到就只进 TS 那几节（老归档给的是裸 CSV，
+            旁边没有这张表）。
+        members: 集合成员数（``--members``）。集合产物的 ``manifest.json`` **不写**
+            这个字段，所以只能从命令行给；不给则报告里凡是要写成员数的句子里
+            省略数字。只在集合产物（``weather_ts_ens``）上有意义。
         spectrum_variable / spectrum_init: 只在连续场链路、且要点名看**某一个起报**
             的谱曲线时才给（读 ``diagnostics/spectrum_by_init.csv``）。
             ``spectrum_init`` 省略时取最后一个起报。
@@ -198,7 +210,11 @@ def build_report(
 
     print(f"能力：{capability} —— {FAMILY_LABELS[family]}")
     if family == "ts":
-        return _render_ts(output_dir, target, full_model_name, change_description, comparisons)
+        return _render_ts(
+            output_dir, target, full_model_name, change_description, comparisons,
+            ensemble=capability == "weather_ts_ens",
+            members=members,
+        )
     return _render_field(
         output_dir,
         target,
@@ -210,14 +226,55 @@ def build_report(
     )
 
 
+def _probability_sibling(csv_path: Path) -> Optional[Path]:
+    """在结果表所在目录里找概率评分表。
+
+    两种命名都收：新的 ``diagnostics/probability_wide.csv``（和结果表同目录），
+    以及老归档把两张裸 CSV 并排放在一起时的 ``aroc_bss*.csv``。**认的是列不是
+    名字**（``load_probability`` 会校验列），所以老命名直接读得进来。
+    找不到返回 ``None``——那几份只进 TS 那几节，不是错误。
+    """
+    parent = Path(csv_path).parent
+    named = parent / PROBABILITY_WIDE_RELATIVE_PATH.name
+    if named.is_file():
+        return named
+    legacy = sorted(parent.glob("aroc_bss*.csv"))
+    return legacy[0] if legacy else None
+
+
+def _coverage_of(wide) -> int:
+    """最小阈值档的**全时效配对样本合计**——与报告第二节「样本合计」列同一口径。
+
+    报告要拿它做「各份来源的样本量差多少」那句话。取值失败（缺列、全是空）返回 0，
+    调用方会把它当作「这份没报样本量」跳过，而不是在报告里写个 0。
+    """
+    if "n_pairs" not in wide.columns or "threshold_mm" not in wide.columns:
+        return 0
+    import pandas as pd
+
+    thresholds = pd.to_numeric(wide["threshold_mm"], errors="coerce")
+    if not thresholds.notna().any():
+        return 0
+    pairs = pd.to_numeric(wide.loc[thresholds == thresholds.min(), "n_pairs"], errors="coerce")
+    return int(pairs.dropna().sum())
+
+
 def _render_ts(
     output_dir: Path,
     target: Path,
     model_name: str,
     change_description: Optional[str],
     comparisons: Optional[Dict[str, Path]] = None,
+    *,
+    ensemble: bool = False,
+    members: Optional[int] = None,
 ) -> Dict[str, Path]:
-    """TS 系列：宽表 → 曲线图 + 报告。``comparisons`` 是 ``{模型名: 对比结果表路径}``。"""
+    """TS 系列：宽表 → 曲线图 + 报告。``comparisons`` 是 ``{模型名: 对比结果表路径}``。
+
+    ``ensemble`` 由 :func:`build_report` 按能力名给定：``weather_ts_ens`` 才打开
+    集合专属措辞。**不靠目录名或 manifest 里的 reader 名去猜**——那些在这个仓库里
+    已经被证明不可靠（本批的 ``weather_ts_ens_s2b`` 里 ``run_id`` 就写着另一个名字）。
+    """
     wide_path = output_dir / CATEGORICAL_WIDE_RELATIVE_PATH
     if not wide_path.is_file():
         raise ValueError(
@@ -243,14 +300,33 @@ def _render_ts(
     # 就得从这里读。读不到（老产物没写这个键）时返回空，报告只显示带名。
     from xmetai_evaluation.visualization.ts_report import region_labels_from
 
+    # 每份来源的表只读一次：宽表要连用三次（主数据、概率同目录、样本量）。
+    frames = {model_name: pd.read_csv(wide_path)}
+    frames.update({name: pd.read_csv(path) for name, path in comparisons.items()})
+
+    # 概率评分：主模型读自己的 diagnostics/，对比模型读**它自己那一行的同目录**
+    # （老归档给的是裸 CSV，旁边没有这张表，自然缺席）。缺表不是错误——那几份只出 TS。
+    probability: Dict[str, object] = {}
+    for name, csv_path in [(model_name, wide_path), *comparisons.items()]:
+        sibling = _probability_sibling(csv_path)
+        if sibling is not None:
+            probability[name] = pd.read_csv(sibling)
+    # 样本量披露：最小阈值档的全时效 n_pairs 合计。取不到的不进覆盖表，
+    # 免得报告里出现「某某 0」这种会被读成"零样本"的数字。
+    coverage = {name: count for name, count in ((n, _coverage_of(f)) for n, f in frames.items()) if count}
+
     return PrecipitationPlotter().create_report(
-        pd.read_csv(wide_path),
+        frames[model_name],
         output_dir=target,
         model_name=model_name,
-        baselines={name: pd.read_csv(path) for name, path in comparisons.items()} or None,
+        baselines={name: frames[name] for name in comparisons} or None,
         sources=sources,
         change_description=change_description,
         region_labels=region_labels_from(output_dir),
+        probability=probability or None,
+        members=members,
+        coverage=coverage or None,
+        ensemble=ensemble,
     )
 
 
@@ -310,6 +386,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
     parser.add_argument(
+        "--members", type=int, default=None,
+        help="集合成员数（只在 weather_ts_ens 上有意义）。产物里没有这个字段，"
+        "报告里凡要写成员数的地方都靠它；不给就省略数字",
+    )
+    parser.add_argument(
         "--compare", action="append", default=None, metavar="名字=CSV路径",
         help="对比模型的结果表（可重复），只在 TS 系列上有意义；"
         "给了就一起进箱线图、差值图与对比表",
@@ -324,6 +405,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         spectrum_init=args.spectrum_init,
         change_description=args.change,
         compare=args.compare,
+        members=args.members,
     )
     for name, path in artifacts.items():
         print(f"  {name}: {path}")

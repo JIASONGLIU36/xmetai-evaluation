@@ -66,7 +66,7 @@ METRIC_OPTIONS["zonal_spectrum"] = {
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
-    name="weather_rmse_single_fuxi",
+    name="weather_rmse_single_fgvp",
     description="确定性连续量检验（FuXi × ERA5）：12 要素逐变量的 RMSE / 谱 / ACC / 活跃度",
     # 走哪套流程模板。模板 = 协议 + 变换 + 指标的预设组合（全部可选值
     # `xmetai-eval --list-pipelines`）。本流程 = grid_valid_time 协议 +

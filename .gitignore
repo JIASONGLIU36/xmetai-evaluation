@@ -37,3 +37,6 @@ tmp_data/
 .claude/
 tests_tmp/
 scripts/
+
+# 本地临时产物（.temp/）：评测中间结果，体积可达 GB
+.temp/

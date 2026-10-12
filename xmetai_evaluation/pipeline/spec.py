@@ -95,6 +95,10 @@ class PipelineSpec:
     template: Optional[PipelineTemplate] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+    #: 多时段评测：[("20250101","20250215"), ("20250601","20250715")]。
+    #: 与 start_date/end_date **二选一**（同时给直接报错，理由见 declared_periods）。
+    #: 多段共用同一个 output_dir、汇进同一套统计量——不是每段各出一套结果。
+    periods: Optional[List[Tuple[str, str]]] = None
     limit: Optional[int] = None
     output_dir: str = "evaluation_results"
     #: 覆盖模板的输出视图（None 表示用模板的）
@@ -181,13 +185,68 @@ class PipelineSpec:
         """观测时刻相对 UTC 的偏移（北京时 = +8）。"""
         return float(self.options.get("local_utc_offset_hours", 8.0))
 
-    def period(self) -> Tuple[datetime, datetime]:
-        """解析评测时间段。"""
+    def declared_periods(self) -> List[Tuple[datetime, datetime]]:
+        """本段要评的时段列表（解析成 datetime 对）。
+
+        ``periods`` 与 ``start_date``/``end_date`` **二选一**：同时给直接报错，
+        不让 ``periods`` 静默盖掉 start/end——配置里躺着两套时段、没人知道哪套
+        生效，是最难查的一类问题。
+
+        单时段走 start_date/end_date，返回长度 1 的列表，下游不用分支。
+        """
+        if self.periods:
+            if self.start_date or self.end_date:
+                raise ConfigError(
+                    "start_date/end_date 与 periods 不能同时给：多时段请删掉 "
+                    "start_date/end_date，单时段请删掉 periods"
+                )
+            parsed: List[Tuple[datetime, datetime]] = []
+            for item in self.periods:
+                pair = tuple(item or ())
+                if len(pair) != 2:
+                    raise ConfigError(
+                        f"periods 的每一项应是 (起始, 结束) 两个日期，收到 {item!r}"
+                    )
+                try:
+                    start = _parse_date(pair[0], "periods 起始")
+                    end = _parse_date(pair[1], "periods 结束")
+                except ValueError as error:
+                    # 统一成 ConfigError：periods 的所有毛病都是配置毛病，
+                    # 别让"少写个日期"和"日期写错"报出两种异常类型。
+                    raise ConfigError(
+                        f"periods 的时段 {item!r} 日期解析失败：{error}"
+                    ) from error
+                if end < start:
+                    raise ConfigError(f"periods 的时段 {item!r} 起止颠倒")
+                parsed.append((start, end))
+            return parsed
         if not self.start_date:
-            raise ValueError("评测配置必须提供 start_date")
+            raise ValueError("评测配置必须提供 start_date 或 periods")
         start = _parse_date(self.start_date, "start_date")
         end = _parse_date(self.end_date, "end_date") if self.end_date else start
-        return start, end
+        return [(start, end)]
+
+    def period(self) -> Tuple[datetime, datetime]:
+        """整体时段的 (最早, 最晚)。
+
+        多段时是一个**覆盖全部段**的包络区间，只用于报错信息与展示——真正驱动
+        切块的是 ``init_candidate_times()``，时段本身不参与别的计算。
+        """
+        periods = self.declared_periods()
+        return min(start for start, _ in periods), max(end for _, end in periods)
+
+    def init_candidate_times(self) -> List[datetime]:
+        """候选起报时刻：逐段按天铺开后并集去重。
+
+        **这是"多时段"唯一的落点。** 计划层与各协议 ``prepare`` 都只拿这个列表
+        去 catalog 探测实际可用的起报，之后切块、时效窗、观测跨度、指标全部只认
+        探测出来的 ``init_times``——所以多段与"跑一个覆盖全部段的大区间再手工剔掉
+        空档期起报"完全等价，省下的只是空档期那些块的算力。
+        """
+        values: set = set()
+        for start, end in self.declared_periods():
+            values.update(daily_times(start, end))
+        return sorted(values)
 
     @classmethod
     def from_config(cls, cfg: Any, pipeline: Optional[str] = None) -> "PipelineSpec":
@@ -231,6 +290,7 @@ class PipelineSpec:
             template=template,
             start_date=cfg.start_date,
             end_date=cfg.end_date,
+            periods=getattr(cfg, "periods", None),
             limit=cfg.limit,
             output_dir=cfg.output_dir,
             writers=(

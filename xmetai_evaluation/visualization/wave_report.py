@@ -114,12 +114,16 @@ def _band_label(low: int, high: int) -> str:
 #: 球谐带功率谱的频带数（骨架里写死「五个球谐总阶数频带」）
 SPHERICAL_BAND_COUNT = len(SPHERICAL_BANDS)
 
-#: 产物里没有**可用**的球谐带功率结果时写进正文的说明。两种情况都走这里：
+#: 产物里没有**可用**的球谐带功率结果时写进正文的说明。三种情况都走这里：
 #: 一是配置的 ``metrics`` 里压根没有 ``spherical_bands``；二是算了，但结果行缺
-#: ``group`` 列、认不出哪一行属于哪个频带（修复前的产物就是这样，重跑评测即可）。
+#: ``group`` 列、认不出哪一行属于哪个频带（修复前的产物就是这样，重跑评测即可）；
+#: 三是老中间层归档转过来的产物——老归档里有 ``spherical_bands_*.csv``，但
+#: ``legacy_ens_to_v2.py`` 早先没翻译这一块（2026-10-10 补上，重转一次即可，
+#: 不用重跑评测）。
 SPHERICAL_ABSENT = (
     "产物里没有可用的球谐带功率结果（要么配置的 `metrics` 里没有 `spherical_bands`，"
-    "要么结果行缺 `group` 列、认不出频带），**本批未出**。"
+    "要么结果行缺 `group` 列、认不出频带，要么是老中间层归档转过来时这一块没被翻译），"
+    "**本批未出**。"
 )
 
 def _season_block() -> List[str]:
@@ -141,7 +145,9 @@ def _season_block() -> List[str]:
         "`references/rmse-batch-evaluation.md` §6「按需子集对比」）：",
         "",
         "- 季节按**起报时刻**（`init_time`）切，**不按** `valid_time`——报告整套契约建立在",
-        "  「共同日期 = 共同 `init_date`」上，一组 `init_date` 必须干净地属于一个季节；",
+        "  「同一天就是同一个 `init_date`」上，一组 `init_date` 必须干净地属于一个季节",
+        "  （默认口径下这些日期还必须是各模型共有的；各模型各用全部起报日时，",
+        "  同一季里各模型的样本天数可以不同，别在这种情况下印「共 N 天」）；",
         "- DJF 按**气象冬季**归组（当年 12 月 + 次年 1、2 月）。不满整年的批次两个冬季",
         "  **各只有一截**（实测 `20250102–20251215`：DJF(2024/25) 只有 1/2–2/28，",
         "  DJF(2025/26) 只有 12/1–12/15），所以报 DJF 要说清是**哪一个冬季**，或者干脆",
@@ -280,19 +286,42 @@ def load_band_power(root, dates: Sequence[str], variable: str,
     return table
 
 
+def band_dates(root, dates: Sequence[str], variable: str) -> List[str]:
+    """该变量**实际有球谐带结果**的起报日（请求日 ∩ 产物日）。
+
+    球谐带不是每一份产物的每个变量都满覆盖（实测有归档的 u200/v200/ws200 只算到
+    某个日期为止）。口径是**有多少算多少**：缺的起报日不进统计，但也不让它把整节
+    拖没——缺了多少由 :func:`_sph_coverage_note` 写在正文里。
+    """
+    rows = metric_rows(root, "spherical_band_power_forecast")
+    rows = rows[rows["variable"].astype(str) == str(variable)]
+    have = set(rows["init_date"].astype(str))
+    return [str(date) for date in dates if str(date) in have]
+
+
 def probe_bands(root, dates: Sequence[str], variables: Sequence[str]) -> bool:
     """产物里有没有**可用**的球谐带功率结果。
 
-    光有结果行不够——还得分得出频带（``group`` 列非空），否则 §4.1–4.3 只能记缺席。
+    「可用」= 分得出频带（``group`` 列非空）**且**至少一个变量在至少一个请求日上
+    有结果。逐变量逐日期的满覆盖**不是**出这一节的前提：缺的日子由
+    :func:`band_dates` 取交集跳过、正文写明。
+
+    这里曾经判「日期集合 ⊆ 有数的日期 且 变量集合 ⊆ 有数的变量」——两个集合各判
+    一次、不管交叉，比 :func:`load_band_power` 的逐变量逐日期宽松，会出现
+    「probe 说有、load 才炸」的落差；现在两边的口径对齐了。
     """
     if not dates or not variables:
         return False
     rows = metric_rows(root, "spherical_band_power_forecast")
     if rows.empty or "group" not in rows.columns or rows["group"].isna().all():
         return False
-    return (
-        {str(date) for date in dates} <= set(rows["init_date"].astype(str))
-        and {str(v) for v in variables} <= set(rows["variable"].astype(str))
+    wanted = {str(date) for date in dates}
+    return any(
+        not rows[
+            (rows["variable"].astype(str) == str(variable))
+            & (rows["init_date"].astype(str).isin(wanted))
+        ].empty
+        for variable in variables
     )
 
 
@@ -384,6 +413,9 @@ class WaveBundle(NamedTuple):
     sph_band_ratio: pd.DataFrame    # 频带 × 模型（均值比）
     sph_variable: pd.DataFrame      # 变量 × 模型（球谐带 log-RMS×100）
     sph_tests: Dict[str, List[PairTest]]  # 频带名 -> 该频带上的配对检验
+    # 模型 -> 变量 -> (实际进统计的起报日数, 请求的起报日数)。满覆盖时两者相等；
+    # 有落差就是这一格被跳过了一部分，正文按它写覆盖说明。
+    sph_coverage: Dict[str, Dict[str, Tuple[int, int]]]
 
     @property
     def names(self) -> List[str]:
@@ -392,6 +424,15 @@ class WaveBundle(NamedTuple):
     @property
     def dates(self) -> List[str]:
         return self.base.dates
+
+    @property
+    def dates_by_model(self) -> Dict[str, List[str]]:
+        """模型 -> 本次统计实际用的起报日（口径见 :func:`det_report.analyze`）。
+
+        默认等于 :attr:`dates`（共同日期）；``own_dates=True`` 时是各模型自己的
+        全部起报日。**给单个模型算平均的地方读这里，配对检验读** :attr:`dates`。
+        """
+        return self.base.dates_by_model
 
     @property
     def spectrum_variables(self) -> List[str]:
@@ -412,25 +453,45 @@ def _pick_primary(names: Sequence[str]) -> Tuple[str, str]:
     return "", ""
 
 
-def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
+def analyze_wave(archives: Sequence[Archive], *,
+                 own_dates: bool = False) -> WaveBundle:
     """跑 ``_single`` 的全套统计，再叠上纬向谱专项。
+
+    ``own_dates`` 与 :func:`det_report.analyze` 同义：每个模型的谱统计用**它自己的
+    全部起报日**，而不是只用共同日期。**配对检验（``zonal_tests`` / ``sph_tests``）
+    不受影响**——日期不对齐的样本做不了 Wilcoxon，那两处永远只在共同日期上做。
 
     Raises:
         ValueError / FileNotFoundError: 见 :func:`det_report.analyze` 与
             :func:`det_report.load_spectrum`。
     """
-    base = analyze(archives)
+    base = analyze(archives, own_dates=own_dates)
     names, dates = base.names, base.dates
+    dates_by_model = base.dates_by_model
     variables = base.spectrum_variables
+
+    def _pair(frame: pd.DataFrame) -> pd.DataFrame:
+        """配对检验的样本：**永远退回共同日期**，且各模型都得有数。
+
+        各模型用自己的日期时，并集帧上每个模型各有一片 NaN；Wilcoxon 要的是同一批
+        日子上的成对样本，所以这里 reindex 到共同日期再丢掉有缺的行。默认口径下
+        各模型索引本来就是共同日期，``dropna`` 不会删掉任何一行（除了一开始就
+        缺数的那些），与旧行为一致。
+        """
+        frame = frame.reindex(index=[str(d) for d in dates])
+        return frame.dropna(how="any") if own_dates else frame
 
     # ``spectra`` 存「波数 × 日期 平均后」的 pred/obs 均值谱（只够画图）；
     # ``raw`` 存逐日的 pred/obs 原表，log-RMS 必须逐日算，不能拿均值谱算。
     spectra: Dict[str, Dict[str, pd.DataFrame]] = {}
     raw: Dict[str, Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]] = {}
     for archive in archives:
+        # 每个模型读自己的那批日子；默认口径下 dates_by_model 就是共同日期，
+        # 与旧行为逐位一致。
+        own = list(dates_by_model[archive.name])
         means, originals = {}, {}
         for variable in variables:
-            pred, obs = load_spectrum(archive.root, dates, variable, archive.name)
+            pred, obs = load_spectrum(archive.root, own, variable, archive.name)
             originals[variable] = (pred, obs)
             means[variable] = pd.DataFrame({"pred": pred.mean(axis=1),
                                             "obs": obs.mean(axis=1)})
@@ -454,7 +515,10 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
         variable_matched[name] = pd.Series(matched_values)
         zonal_per_date_frames[name] = pd.concat(per_date, axis=1).mean(axis=1) if per_date else pd.Series(dtype=float)
 
-    zonal_per_date = pd.DataFrame(zonal_per_date_frames).reindex(index=dates)
+    zonal_per_date = pd.DataFrame(zonal_per_date_frames)
+    if not own_dates:
+        # 共同日期口径下各模型索引本来相同，这次 reindex 是保单（顺序 + 缺行）。
+        zonal_per_date = zonal_per_date.reindex(index=[str(d) for d in dates])
     variable_logrms = pd.DataFrame(variable_logrms).reindex(index=variables)
     variable_matched = pd.DataFrame(variable_matched).reindex(index=variables)
     zonal_full = variable_logrms.mean(axis=0)
@@ -484,18 +548,21 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
     band_logrms = pd.DataFrame(band_rows_logrms).reindex(index=band_order)
     band_ratio = pd.DataFrame(band_rows_ratio).reindex(index=band_order)
 
-    zonal_tests = paired_tests(zonal_per_date)
+    zonal_tests = paired_tests(_pair(zonal_per_date))
     primary, reference = _pick_primary(names)
 
     # --- 球谐带功率（没有结果、或结果缺 group 列认不出频带时，整块留空、正文标注缺席）---
     band_names = [_band_label(lo, hi) for lo, hi in SPHERICAL_BANDS]
-    sph_available = all(probe_bands(a.root, dates, variables) for a in archives)
+    sph_available = all(
+        probe_bands(a.root, dates_by_model[a.name], variables) for a in archives
+    )
     sph_tests: Dict[str, List[PairTest]] = {}
     sph_rms: Dict[str, float] = {}
     sph_bias: Dict[str, float] = {}
     sph_band_logrms = pd.DataFrame(index=band_names)
     sph_band_ratio = pd.DataFrame(index=band_names)
     sph_variable = pd.DataFrame(index=variables)
+    sph_coverage: Dict[str, Dict[str, Tuple[int, int]]] = {}
     if sph_available:
         logrms_rows, ratio_rows, variable_rows = {}, {}, {}
         daily: Dict[str, Dict[str, pd.Series]] = {}
@@ -506,8 +573,17 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
             ratios: Dict[str, List[np.ndarray]] = {}
             per_variable: Dict[str, List[np.ndarray]] = {}
             daily_parts: Dict[str, List[pd.Series]] = {b: [] for b in band_names}
+            wanted = list(dates_by_model[archive.name])
+            coverage: Dict[str, Tuple[int, int]] = {}
             for variable in variables:
-                table = load_band_power(archive.root, dates, variable, archive.name)
+                # 有多少算多少：只拿这个变量**真的有球谐带**的起报日。
+                used = band_dates(archive.root, wanted, variable)
+                coverage[variable] = (len(used), len(wanted))
+                if not used:
+                    # 这个变量在这份产物里一天都没有：不参与统计，表里该格留空，
+                    # 缺多少由正文的覆盖说明交代。
+                    continue
+                table = load_band_power(archive.root, used, variable, archive.name)
                 for low, high in SPHERICAL_BANDS:
                     label = _band_label(low, high)
                     pair = table.get(_band_tag(low, high))
@@ -532,9 +608,10 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
                 b: (pd.concat(daily_parts[b], axis=1).mean(axis=1)
                     if daily_parts[b] else pd.Series(dtype=float))
                 for b in band_names}
+            sph_coverage[archive.name] = coverage
         for label in band_names:      # 同一频带内跨模型配对；指标即频带，故逐频带各做一轮
             frame = pd.DataFrame({n: daily[n][label] for n in names})
-            sph_tests[label] = paired_tests(frame.reindex(index=dates))
+            sph_tests[label] = paired_tests(_pair(frame))
         sph_band_logrms = pd.DataFrame(logrms_rows).reindex(index=band_names)
         sph_band_ratio = pd.DataFrame(ratio_rows).reindex(index=band_names)
         sph_variable = pd.DataFrame(variable_rows).reindex(index=variables)
@@ -551,6 +628,7 @@ def analyze_wave(archives: Sequence[Archive]) -> WaveBundle:
         sph_available=sph_available, sph_rms=sph_rms, sph_bias=sph_bias,
         sph_band_logrms=sph_band_logrms, sph_band_ratio=sph_band_ratio,
         sph_variable=sph_variable, sph_tests=sph_tests,
+        sph_coverage=sph_coverage,
     )
 
 
@@ -663,6 +741,44 @@ def _plot_spectrum_ratio(out_dir: Path, filename: str, spectra: Mapping[str, pd.
 # ====================================================================== 渲染
 
 
+def _own_dates_mode(bundle: WaveBundle) -> bool:
+    """本次是不是「各模型用各自全部起报日」的口径。
+
+    数据驱动、不去问调用方传了什么：默认口径下 ``dates_by_model[name]`` 就是
+    共同日期，只要有一个模型不一样就是各用各的。
+    """
+    common = set(bundle.dates)
+    return any(set(own) != common for own in bundle.dates_by_model.values())
+
+
+def _scope_counts(bundle: WaveBundle) -> str:
+    """各模型的天数清单（``AIFS 27 天、FGVP 228 天、…``），按模型名升序。"""
+    return "、".join(
+        f"{name} {len(bundle.dates_by_model[name])} 天" for name in sorted(bundle.names)
+    )
+
+
+def _date_word(bundle: WaveBundle) -> str:
+    """句子里的短口径词：默认 ``26 个共同日期``，各用各的时 ``各模型各自的全部起报日``。"""
+    if not _own_dates_mode(bundle):
+        return f"{len(bundle.dates)} 个共同日期"
+    return "各模型各自的全部起报日"
+
+
+def _date_span_word(bundle: WaveBundle) -> str:
+    """替代 ``{_date_span(dates)} 共同日期`` 那一截，各用各的时只留口径词。"""
+    if not _own_dates_mode(bundle):
+        return f"{_date_span(bundle.dates)} 共同日期"
+    return "各模型各自的全部起报日"
+
+
+def _scope_detail(bundle: WaveBundle) -> str:
+    """正文里交代日期口径的那一句，两种口径都返回**自带括号**的短语。"""
+    if not _own_dates_mode(bundle):
+        return f"{len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}）"
+    return f"各模型各自的全部起报日（{_scope_counts(bundle)}）"
+
+
 def _section_conclusion(bundle: WaveBundle) -> List[str]:
     base = bundle.base
     names = bundle.names
@@ -704,6 +820,16 @@ def _section_conclusion(bundle: WaveBundle) -> List[str]:
             f"{direction} {_fmt(abs(delta), 2)}；综合相对 RMSE "
             f"{_fmt(base.relative_composite[reference])} → {_fmt(base.relative_composite[primary])}。"
         )
+    if _own_dates_mode(bundle):
+        # 谱比随季节、随天气过程变化明显，各模型又取的是不同时段——这段差异里
+        # 有多少是模式差异、多少是样本时段差异，本报告分不开。必须写在摘要里。
+        items.append(
+            f"日期口径：每个模型都用各自全部起报日"
+            f"（{_scope_counts(bundle)}），谱与 log-RMS 的均值来自**不同时段**，"
+            f"跨模型的相对位次因此同时包含模式差异与时段差异，"
+            f"**不是同一批日期上的公平对比**；只有配对检验"
+            f"退回 {len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}）。"
+        )
     items.append(
         f"选型取向：谱保真度优先看纬向谱（{zonal_best}）"
         + (f"与球谐带（{bundle.sph_rms.idxmin()}）" if bundle.sph_available else "")
@@ -714,9 +840,20 @@ def _section_conclusion(bundle: WaveBundle) -> List[str]:
         "",
         # 先交代评估基本信息（评的是谁、多少天、什么指标），再给结论
         f"本报告评估{'、'.join(sorted(names))}共{_cn(len(names))}个模型，"
-        f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
-        f"口径为纬向 FFT 与球谐带功率谱，RMSE / ACC / FA 只作基线。"
-        f"本报告是补充分析，不修订、也不替代原输出级评估检验报告。",
+        + (
+            f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
+            if not _own_dates_mode(bundle)
+            else f"覆盖时段不等长（{_scope_counts(bundle)}）；"
+        )
+        + f"口径为纬向 FFT 与球谐带功率谱，RMSE / ACC / FA 只作基线。"
+        + (
+            "本报告是补充分析，不修订、也不替代原输出级评估检验报告。"
+            if not _own_dates_mode(bundle)
+            else "本报告中每个模型都用自己的全部起报日——各自的平均、各自的天数，"
+            "各表各图并不是在同一批日期上对比（详见第 2 节）；"
+            "各处的配对检验退回共同日期，那是全报告唯一公平的一处。"
+            "本报告是补充分析，不修订、也不替代原输出级评估检验报告。"
+        ),
         "",
         # 结论并成一段而不是逐条列点：读起来是判断，不是清单
         "".join(items),
@@ -736,19 +873,25 @@ def _section_scope(bundle: WaveBundle) -> List[str]:
         summary = archive.summary
         own_dates = sorted(set(summary["init_date"]))
         shared = len(set(own_dates) & set(bundle.dates))
+        # 本次真正进了统计的那几天：默认口径下就是共同日期，各用各的时是自己的全部。
+        used = list(bundle.dates_by_model[archive.name])
         rmse_columns = [c for c in summary.columns if c.startswith("rmse_")]
-        # 缺文件按 stem 实探，不看 summary 有没有行——两者可能对不上
-        missing_dates = probe_dates(archive.root, bundle.dates, "rmse")
+        # 缺文件按 stem 实探，不看 summary 有没有行——两者可能对不上。
+        # 探的是**本次实际用的那几天**，不是共同日期：各用各的时两者不是一批。
+        missing_dates = probe_dates(archive.root, used, "rmse")
         missing = "无" if not missing_dates else f"{len(missing_dates)} 天：{missing_dates[0]} 等"
         nan_mask = summary[rmse_columns].isna().any(axis=1) if rmse_columns else None
         nan_all = summary.loc[nan_mask, "init_date"].tolist() if nan_mask is not None else []
         # 这一列统计的是**该模型自己的全部日期**，不是共同日期——不写清楚会被读成
-        # 「共同 168 天里有 15 天是 NaN」，那是另一回事。
-        nan_outside = [d for d in nan_all if d not in set(bundle.dates)]
+        # 「共同 168 天里有 15 天是 NaN」，那是另一回事。窗口按本次实际用的那几天算。
+        nan_outside = [d for d in nan_all if d not in set(used)]
         # 注意这里要的是**窗口之内**的天数。nan_outside 是窗口之外的那一批，
         # 拿它的长度去填「落在窗口之内」的句子会整体说反：全是窗口外的日期时
         # 反而报成「其中 15 天落在共同窗口之内」。
         nan_inside = len(nan_all) - len(nan_outside)
+        # 「窗口」指本次统计实际用的那几天。默认口径下就是共同日期，各用各的时
+        # 是该模型自己的全部起报日——这时 NaN 天必然全在窗口内，正是要说清的事。
+        window = "共同窗口" if not _own_dates_mode(bundle) else "本次统计窗口"
         rows.append([
             name, len(own_dates), _date_span(own_dates), shared,
             missing, f"{len(nan_all)}（全区间）" if nan_all else "无",
@@ -757,9 +900,9 @@ def _section_scope(bundle: WaveBundle) -> List[str]:
             nan_notes.append(
                 f"{name} 的 {len(nan_all)} 天 RMSE 为 NaN"
                 + (f"（{nan_all[0]}–{nan_all[-1]}）" if len(nan_all) > 1 else f"（{nan_all[0]}）")
-                + ("全部落在共同窗口之外，不影响本报告任何统计"
+                + (f"全部落在{window}之外，不影响本报告任何统计"
                    if not nan_inside else
-                   f"，其中 {nan_inside} 天落在共同窗口**之内**，需先查明原因")
+                   f"，其中 {nan_inside} 天落在{window}**之内**，需先查明原因")
                 + "。"
             )
     lines += _table(
@@ -776,12 +919,22 @@ def _section_scope(bundle: WaveBundle) -> List[str]:
     spectrum_variables = bundle.spectrum_variables
     lines += [
         "",
-        f"所有统计均使用{_cn(len(names))}个模型的共同{len(bundle.dates)}天和{leads}个 lead"
-        f"（{first}–{last}h）。RMSE 使用{_cn(len(variables))}个共同变量；"
-        f"FA 使用所有模型都提供的{_cn(len(fa_variables))}个变量："
-        f"{'、'.join(fa_variables)}；功率谱使用{_cn(len(spectrum_variables))}个变量："
-        f"{'、'.join(spectrum_variables)}。全部{_cn(len(names))}个模型在整个共同日期区间上都有完整结果，"
-        f"无缺席模型。",
+        (
+            f"所有统计均使用{_cn(len(names))}个模型的共同{len(bundle.dates)}天和"
+            f"{leads}个 lead（{first}–{last}h）。RMSE 使用{_cn(len(variables))}个共同变量；"
+            f"FA 使用所有模型都提供的{_cn(len(fa_variables))}个变量："
+            f"{'、'.join(fa_variables)}；功率谱使用{_cn(len(spectrum_variables))}个变量："
+            f"{'、'.join(spectrum_variables)}。全部{_cn(len(names))}个模型在整个共同日期区间上"
+            f"都有完整结果，无缺席模型。"
+            if not _own_dates_mode(bundle) else
+            f"所有统计均按**每个模型自己的全部起报日**做：{_scope_counts(bundle)}，"
+            f"lead 一律 {leads} 个（{first}–{last}h）。RMSE 使用{_cn(len(variables))}个共同变量；"
+            f"FA 使用所有模型都提供的{_cn(len(fa_variables))}个变量："
+            f"{'、'.join(fa_variables)}；功率谱使用{_cn(len(spectrum_variables))}个变量："
+            f"{'、'.join(spectrum_variables)}。各表各图的天数不同、时段也不同，"
+            f"**上表的「日期数」就是该模型本次实际用的天数**，"
+            f"「共同日期」那一列才是各模型共有的、也就是下面配对检验能用的天数。"
+        ),
         "",
         "## 2.1 指标定义",
         "",
@@ -814,7 +967,13 @@ def _section_scope(bundle: WaveBundle) -> List[str]:
     lines += [
         "",
         f"配对比较采用{len(bundle.dates)}个日度样本的 Wilcoxon 符号秩检验，"
-        f"并对同一指标族的{pairs}个模型对做 Holm 多重校正。统计显著不代表业务重要性。",
+        f"并对同一指标族的{pairs}个模型对做 Holm 多重校正。统计显著不代表业务重要性。"
+        + ("" if not _own_dates_mode(bundle) else
+           f"**配对检验是全报告唯一在共同日期上做的比较**："
+           f"配对要求两边在同一天有数，各模型自己的日期对不齐，"
+           f"所以上面各表用各模型全部起报日、这里的样本却只有各模型共有的 "
+           f"{len(bundle.dates)} 天，两者不是同一批，"
+           f"表里的均值也**不会**等于检验时的均值。"),
         "",
     ]
     return lines
@@ -839,7 +998,9 @@ def _section_overall(bundle: WaveBundle) -> List[str]:
     )
     lines += ["", "相关图：", "", "![overall_summary](overall_summary.png)", "",
               "图 1：{模型数}模型的综合相对 RMSE、ACC、FA 偏差与纬向谱 log-RMS×100 对比"
-              "（共同日期平均，柱高越低越好，ACC 除外）。".replace("{模型数}", _cn(len(bundle.names))), ""]
+              "（{日期口径}平均，柱高越低越好，ACC 除外）。"
+              .replace("{模型数}", _cn(len(bundle.names)))
+              .replace("{日期口径}", _date_word(bundle)), ""]
 
     return lines
 
@@ -964,6 +1125,34 @@ def _spherical_tests_section(bundle: WaveBundle) -> List[str]:
     return lines
 
 
+def _sph_coverage_note(bundle: WaveBundle) -> List[str]:
+    """球谐带里被跳过的样本，逐模型逐变量写明；一格不缺就返回空表。
+
+    口径是**有多少算多少**——缺的起报日不进统计，但绝不静默：这里把落差摊开写，
+    读者才知道哪几格和满覆盖的模型不同源。
+    """
+    drops = []
+    for name in bundle.names:
+        short = [
+            (variable, used, requested)
+            for variable, (used, requested) in sorted(bundle.sph_coverage.get(name, {}).items())
+            if used < requested
+        ]
+        if short:
+            drops.append(
+                f"{name} 的 "
+                + "、".join(f"{variable} 用 {used}/{requested} 天" for variable, used, requested in short)
+            )
+    if not drops:
+        return []
+    return [
+        "**球谐带的样本不是每一格都满**：" + "；".join(drops)
+        + "。缺的那些起报日在产物里本来就没有该变量的球谐带结果，本节按**实际有数的日子**"
+        "统计，不插补、不折算；这些格子和满覆盖的模型/变量**不同源**，横向比高低之前先看这一条。",
+        "",
+    ]
+
+
 def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[str]:
     base = bundle.base
     names = bundle.names
@@ -977,6 +1166,7 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         + ("" if bundle.sph_available else SPHERICAL_ABSENT),
         "",
     ]
+    lines += _sph_coverage_note(bundle)
     lines += _spherical_bands_section(bundle)
     lines += _spherical_variables_section(bundle)
     lines += _spherical_tests_section(bundle)
@@ -1034,13 +1224,17 @@ def _section_spectrum(bundle: WaveBundle, figures: Mapping[str, str]) -> List[st
         "",
         "## 4.6 平均功率谱与比值曲线",
         "",
-        f"下列曲线是{len(bundle.dates)}个日度功率谱的平均。黑线为 ERA5，"
+        f"下列曲线是{_date_word(bundle)}平均出来的日度功率谱。黑线为 ERA5，"
         f"彩色线为{_cn(len(names))}个模型的预测谱；比值为 pred/obs，理想值为 1，"
-        f"图中断面显示范围限定为 0.1–10。变量取 {base.spectrum_variable}。",
+        f"图中断面显示范围限定为 0.1–10。变量取 {base.spectrum_variable}。"
+        + ("" if not _own_dates_mode(bundle) else
+           "**各模型平均用的是各自那批日子**，所以曲线高低里同时含模式差异与"
+           "时段差异，逐条曲线之间不是同一批样本。"),
         "",
         "![mean_power_spectrum](mean_power_spectrum.png)",
         "",
-        f"图 5：{base.spectrum_variable} 纬向功率谱（{len(bundle.dates)} 个共同日期平均，双对数坐标）。",
+        f"图 5：{base.spectrum_variable} 纬向功率谱"
+        f"（{_date_word(bundle)}平均，双对数坐标）。",
         "",
         "![spectrum_ratio](spectrum_ratio.png)",
         "",
@@ -1171,7 +1365,11 @@ def _appendix(bundle: WaveBundle, figures: Mapping[str, str],
             ["产物大小", f"{total_bytes / 1024 / 1024:.1f} MB"],
             ["SHA-256", "—（多目录产物，未逐文件计算）"],
             ["模型", "、".join(names)],
-            ["共同日期", f"{len(bundle.dates)} 天，{_date_span(bundle.dates)}"],
+            # 默认口径下保持老那一行的标签与格式不动；各用各的时没有「共同日期」
+            # 可言，换成口径说明（天数清单）。
+            (["共同日期", f"{len(bundle.dates)} 天，{_date_span(bundle.dates)}"]
+             if not _own_dates_mode(bundle) else
+             ["日期口径", _scope_detail(bundle)]),
             ["lead", f"{leads} 个，{first}–{last}h，间隔 {step:g}h"],
             ["分析结果目录", str(out_dir)],
         ],
@@ -1232,12 +1430,17 @@ def render_wave(bundle: WaveBundle, figures: Mapping[str, str], *,
 
 
 def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
-                      archive: Optional[str] = None) -> Dict[str, Path]:
-    """出图 + 写 ``REPORT.md``，返回产物名 → 路径。"""
+                      archive: Optional[str] = None,
+                      own_dates: bool = False) -> Dict[str, Path]:
+    """出图 + 写 ``REPORT.md``，返回产物名 → 路径。
+
+    ``own_dates`` 见 :func:`analyze_wave`：每个模型按自己的全部起报日统计，
+    配对检验仍退回共同日期。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle = analyze_wave(archives)
+    bundle = analyze_wave(archives, own_dates=own_dates)
     names = bundle.names
     base = bundle.base
 
@@ -1295,7 +1498,7 @@ def build_wave_report(archives: Sequence[Archive], out_dir: Path, *,
     spectra = {name: frame[variable] for name, frame in bundle.spectra.items()}
     _plot_mean_spectrum(
         out_dir, figures["mean_power_spectrum"], spectra, variable=variable,
-        suptitle=f"{variable} 纬向功率谱（{len(bundle.dates)} 日期平均）",
+        suptitle=f"{variable} 纬向功率谱（{_date_word(bundle)}平均）",
     )
     _plot_spectrum_ratio(
         out_dir, figures["spectrum_ratio"], spectra, variable=variable,

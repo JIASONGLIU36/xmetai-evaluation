@@ -34,9 +34,10 @@ window_h,lead_h,grade,threshold_mm,hits,misses,false_alarms,n_pairs,TS,POD,FAR,�
 > 阈值表随窗口而变：24h 常用 `0.1/10/25/50/100`，6h 常用 `0.1/13/25`。
 > **不同窗口的阈值不可混在一张图上比较。**
 
-### 2.1 概率评分表（`aroc_bss_<name>.csv`，只有集合跑法有）
+### 2.1 概率评分表（`diagnostics/probability_wide.csv`，只有集合跑法有）
 
-跟 `ts_<name>.csv` 落在**同一个目录**（不在 `diagnostics/` 下）：
+跟 TS 那份**分开放**：TS 在 `diagnostics/categorical_wide.csv`，概率评分在
+`diagnostics/probability_wide.csv`，两份都由 v2 能力直接写出。
 
 ```csv
 window_h,lead_h,grade,threshold_mm,AROC,BS,BS_ref,BSS,base_rate,n_points,n_used
@@ -44,10 +45,14 @@ window_h,lead_h,grade,threshold_mm,AROC,BS,BS_ref,BSS,base_rate,n_points,n_used
 6,24,AVG,,0.832283,0.0439618,,0.142172,,,4
 ```
 
-- **每个时效除了逐阈值行，末尾还有一行 `grade="AVG"`**：`threshold_mm` / `base_rate` /
-  `n_points` 为空，`n_used` 是参与平均的档数；
-- `BS_ref` 只有**给了 `--ref` 的 6h 窗**才有值，其余窗口整列为空；
+- **有产物带 AVG 行、也有产物不带**：渲染器两者都吃——没有 AVG 行时自己按
+  **可算阈值等权平均**算出来（某档无有效值就跳过，不拿 0 顶替）；
+- `BS_ref` 只有**给了外部气候概率参考的 6h 窗**才有值，其余窗口整列为空；
 - **这张表不进** `diagnostics/categorical_wide.csv`，是独立的一份；
+- 报告侧**只认表在不在，不认文件名**：在主模型目录、以及每个 `--compare` 的
+  **同目录**各找一次，先找 `probability_wide.csv`，再找老命名的 `aroc_bss*.csv`
+  （`weather_ts_ens_aifs` 那种只把两张裸 CSV 并排放在一起的归档），找到的进第六节，
+  两份都没有的那份只出 TS（老 `ts_multi_*` 归档就是这种）；
 - 指标定义见 `evaluation-metrics.md` §2，判读门槛见 `diagnostic-rules.md` §6。
 
 ---
@@ -117,11 +122,10 @@ reports/<模型>_<批次>/
   REPORT.md
 ```
 
-集合那份还应当多出一张概率评分的图（骨架里叫 `${概率窗口}h_AROC_BSS_vs_lead.png`），
-**但目前出不来**：`core/api.py` 的 `run_ts_ens` 把 `window_aroc` 置空，
-真正算 AROC/BSS 的 `weather_ts_ens_prob` 在 `README.md` 里标着 `[BLOCKED]`，
-`visualization/` 里也没有任何 AROC/BSS 的取数或绘图代码。
-数据表（`aroc_bss_<name>.csv`）本身是有的，缺的是读它、画它的那一层。
+集合那份还多一张概率评分的图（`${概率窗口}h_AROC_BSS_vs_lead.png`，骨架里是图 9），
+**窗口前缀取概率表自己的 `window_h`（6h），不是 TS 的 24h**——两套口径不共用一个前缀。
+它跟第六节的表、小结一起，只在拿得到概率表（`probability_wide.csv` 或老命名的
+`aroc_bss*.csv`）时出现；没有那张表时这一节连同它的图表号一起消失，后面的号自己收回来。
 
 `REPORT.md` 写成**论文实验章节**的样子——每节是「引导句 → 图表 → 小结」，
 不是"表格 + 末尾一堆裸图"。二 / 三 / 四 / 五这四节**三个分支逐字相同**：
@@ -236,7 +240,7 @@ reports/<模型>_<批次>/
 | 要对比多个模型 | `--compare "名字=宽表路径"`（可重复）；对比对象是**宽表**，不是产物目录（没有 manifest，认不出能力） |
 | 要对比多个模型、但没说对比谁 | 看主模型目录的**同级目录**：有 `diagnostics/categorical_wide.csv` 的就是候选（`_archive/` 不算）；名字取 `run_id` 去掉 `weather_ts_det_` / `weather_ts_ens_` 前缀的模型简称；**先把清单报给用户确认**再跑 |
 | 两个目录看着是同一个模型 | 逐格比 `n_pairs`——完全一样就是同一次评测的两次运行，别同时放进对比图（会画出两个重合的箱子） |
-| 集合预报 | **两份产物**：`categorical_wide.csv` 里是**集合平均场**的 TS（确定性口径），`aroc_bss_<name>.csv` 里才是概率评分。报告走 `weather_ts_ens.md`，多一节概率评分；两套数**不要混图**（见 §3.1） |
+| 集合预报 | **两份产物**：`diagnostics/categorical_wide.csv` 里是**集合平均场**的 TS（确定性口径），`diagnostics/probability_wide.csv` 里才是概率评分。报告走 `weather_ts_ens.md`，多一节概率评分；两套数**不要混图**（见 §3.1） |
 | 集合跑法没给 `--ref` | `BS_ref` 整列为空，BSS 算不出来——如实写"无气候基准"，别拿别的窗口顶上 |
 
 ---

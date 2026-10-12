@@ -39,7 +39,7 @@ from xmetai_evaluation.pipeline.matcher import (
     align_lon_to,
     align_to_grid,
 )
-from xmetai_evaluation.pipeline.spec import PipelineSpec, daily_times, hourly_times
+from xmetai_evaluation.pipeline.spec import PipelineSpec, hourly_times
 from xmetai_evaluation.pipeline.typhoon import diagnose_track, match_errors
 from xmetai_evaluation.transforms.temporal import window_sum_at
 
@@ -431,7 +431,7 @@ class StationValidTimeProtocol(Protocol):
                 DataRequest(
                     source_id=forecast.source_id,
                     variables=[self.forecast_var],
-                    init_times=daily_times(start, end),
+                    init_times=self.spec.init_candidate_times(),
                 )
             )
             init_times = forecast.reader.available_init_times(discovered)
@@ -856,7 +856,7 @@ class GridValidTimeProtocol(Protocol):
                 DataRequest(
                     source_id=forecast.source_id,
                     variables=self.forecast_vars,
-                    init_times=daily_times(start, end),
+                    init_times=self.spec.init_candidate_times(),
                 )
             )
             init_times = forecast.reader.available_init_times(discovered)
@@ -1266,7 +1266,7 @@ class TyphoonTrackProtocol(Protocol):
                 DataRequest(
                     source_id=forecast.source_id,
                     variables=[self.forecast_var],
-                    init_times=daily_times(start, end),
+                    init_times=self.spec.init_candidate_times(),
                 )
             )
             init_times = forecast.reader.available_init_times(discovered)

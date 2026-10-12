@@ -345,6 +345,10 @@ class EnsBundle(NamedTuple):
         return self.base.dates
 
     @property
+    def dates_by_model(self) -> Dict[str, List[str]]:
+        return self.base.dates_by_model
+
+    @property
     def archives(self) -> Dict[str, Archive]:
         return self.base.archives
 
@@ -390,19 +394,44 @@ def _common_dates_or_raise(archives: Sequence[Archive]) -> List[str]:
     )
 
 
-def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
+def analyze_ens(archives: Sequence[Archive], *,
+                members: Optional[int] = None,
+                own_dates: bool = False) -> EnsBundle:
     """算齐集合报告要的一切。
+
+    Args:
+        members: 集合成员数，命令行给的**字面量**。产物里根本没记这个字段
+            （见 :func:`_unique_summary_value`），所以报告要写成员数只能从外面传；
+            给了就对**所有模型**一律用它。不给就退回产物里若有若无的
+            ``n_members`` 列，新产物上取不到、渲染成「—」。
+        own_dates: 每个模型的 CRPS／离散度／ACC／谱按**它自己的全部起报日**算，
+            而不是只在共同日期上算；只有 §6 的配对检验退回共同日期。
+            见 :func:`det_report.analyze` 的同名参数。
 
     Raises:
         ValueError: 共同日期 < 2（点名说清谁和谁没交集）、缺逐日文件、
             各日期的列集合不一致。
     """
     _common_dates_or_raise(archives)
-    base = analyze(archives)
+    base = analyze(archives, own_dates=own_dates)
     names = base.names
-    dates = base.dates
+    dates = base.dates  # 共同日期：§6 与 §2「有效共同日期」那一行用
+    dates_by_model = base.dates_by_model  # 各模型本次统计实际用的起报日
 
-    members = {a.name: _unique_summary_value(a, "n_members") for a in archives}
+    def _pair(frame: pd.DataFrame) -> pd.DataFrame:
+        """裁到共同日期；``own_dates`` 时再丢掉任何模型缺数的那些日子。
+
+        §6 的指标族是**逐日配对**的（项 = 变量、样本 = 日期），同一次 Wilcoxon 里
+        所有模型必须站在同一批日期上；各模型覆盖时段不同时，并集里那些只有一两个
+        模型有数的日子谁也代表不了，直接不要。默认路径**不丢**，逐字保持既有行为。
+        """
+        frame = frame.reindex(index=[str(d) for d in dates])
+        return frame.dropna(how="any") if own_dates else frame
+
+    members = {
+        a.name: members if members is not None else _unique_summary_value(a, "n_members")
+        for a in archives
+    }
     leads = {a.name: _unique_summary_value(a, "n_leads") for a in archives}
 
     # --- 集合特有指标：CRPS 与离散度（逐日读，不用 summary 里 precomputed 的列）---
@@ -412,11 +441,15 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
     spread_ratio_per_date: Dict[str, Dict[str, pd.Series]] = {}
     spread_sources = set()
     for archive in archives:
-        by_lead, frames = load_daily_frames(archive.root, "crps", dates, archive.name)
+        by_lead, frames = load_daily_frames(
+            archive.root, "crps", dates_by_model[archive.name], archive.name
+        )
         crps_by_lead[archive.name] = by_lead
         crps_per_date[archive.name] = _per_date_means(frames)
 
-        ratio_frames, source = load_spread_rmse_ratio(archive.root, dates, archive.name)
+        ratio_frames, source = load_spread_rmse_ratio(
+            archive.root, dates_by_model[archive.name], archive.name
+        )
         spread_sources.add(source)
         stacked = pd.concat(ratio_frames.values(), axis=0)
         spread_ratio_by_lead[archive.name] = stacked.groupby(level=0).mean().sort_index()
@@ -432,7 +465,9 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
     # --- ACC 逐变量（§6 的 ACC 指标族要逐变量，base 只给 acc_variable）---
     acc_columns = _shared_columns(base.acc_by_lead)
     acc_per_date = {
-        archive.name: _acc_per_variable(archive.root, dates, acc_columns, archive.name)
+        archive.name: _acc_per_variable(
+            archive.root, dates_by_model[archive.name], acc_columns, archive.name
+        )
         for archive in archives
     }
 
@@ -442,7 +477,9 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
     for variable in base.spectrum_variables:
         per_model: Dict[str, pd.DataFrame] = {}
         for archive in archives:
-            pred, obs = load_spectrum(archive.root, dates, variable, archive.name)
+            pred, obs = load_spectrum(
+                archive.root, dates_by_model[archive.name], variable, archive.name
+            )
             per_model[archive.name] = pd.DataFrame(
                 {"pred": pred.mean(axis=1), "obs": obs.mean(axis=1)}
             )
@@ -460,27 +497,30 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
         {name: _log_deviation_scalar(spread_ratio_by_lead[name]) for name in names}
     )
 
-    # --- §6 指标族：项 = 变量，样本 = 共同日期（逐日配对）---
+    # --- §6 指标族：项 = 变量，样本 = **共同日期**（逐日配对）---
+    # 上面那几个逐日字典（crps/spread/acc/谱）在 own_dates=True 时是按各模型自己的
+    # 日期算的，长度不一；这里塞进 DataFrame 后统一裁到共同日期，检验才成立。
+    # own_dates=False 时所有帧本来就只有共同日期，``_pair`` 是恒等变换。
     families: Dict[str, Dict[str, pd.DataFrame]] = {
-        "RMSE": dict(base.per_variable_rmse),
+        "RMSE": {v: _pair(f) for v, f in base.per_variable_rmse.items()},
         "CRPS": {
-            variable: pd.DataFrame({name: crps_per_date[name][variable] for name in names})
+            variable: _pair(pd.DataFrame({name: crps_per_date[name][variable] for name in names}))
             for variable in crps_variables
         },
         "ACC": {
-            variable: pd.DataFrame({name: acc_per_date[name][variable] for name in names})
+            variable: _pair(pd.DataFrame({name: acc_per_date[name][variable] for name in names}))
             for variable in sorted(acc_per_date[names[0]])
         },
         "FA ratio 偏差": {
-            variable: pd.DataFrame(
-                {name: (base.fa_ratio_by_lead[name][variable] - 1.0).abs() for name in names}
-            )
+            variable: _pair(pd.DataFrame(
+                    {name: (base.fa_ratio_by_lead[name][variable] - 1.0).abs() for name in names}
+                ))
             for variable in base.fa_variables
         },
         "Spread/RMSE 距1": {
-            variable: pd.DataFrame(
-                {name: (spread_ratio_per_date[name][variable] - 1.0).abs() for name in names}
-            )
+            variable: _pair(pd.DataFrame(
+                    {name: (spread_ratio_per_date[name][variable] - 1.0).abs() for name in names}
+                ))
             for variable in spread_variables
         },
     }
@@ -511,7 +551,7 @@ def analyze_ens(archives: Sequence[Archive]) -> EnsBundle:
         try:
             for archive in archives:
                 frames, _source = load_spread_rmse_ratio(
-                    archive.root, dates, archive.name, region=region
+                    archive.root, dates_by_model[archive.name], archive.name, region=region
                 )
                 own[archive.name] = float(np.nanmean(pd.concat(frames.values(), axis=0).values))
         except (FileNotFoundError, ValueError):
@@ -622,6 +662,93 @@ def _named(names: Sequence[str]) -> str:
     return "、".join(str(n) for n in names)
 
 
+# ------------------------------------------------------------------ 日期口径
+# 报告有两种日期口径，取决于 ``analyze`` 的 ``own_dates``：
+#   * 默认（共同日期）：所有模型的每一项统计都只在各模型**都**有数的那些日子上算。
+#   * 各自的全部起报日：每个模型按自己的全部起报日算，天数可以互不相同，
+#     只有 §6 的配对检验退回共同日期（日期不对齐做不了 Wilcoxon）。
+# 下面这组函数是两种口径下**唯一**该写日期的地方；不要在别处手拼「共同日期」四个字，
+# 否则 own_dates 那一档会出现「正文说 26 天、表里是 228 天」这种自相矛盾。
+
+
+def _own_dates_mode(bundle: EnsBundle) -> bool:
+    """本次统计是不是「各模型用自己的全部起报日」。
+
+    判据是各模型实际用的日期集**是否等于**共同日期集——默认口径下 ``dates_by_model``
+    每一项就是 ``dates`` 本身，所以这个判断不需要额外开关，跟着数据走。
+    """
+    common = set(bundle.dates)
+    return any(set(own) != common for own in bundle.dates_by_model.values())
+
+
+def _date_word(bundle: EnsBundle) -> str:
+    """图注／句子里的短口径词：默认 ``26 个共同日期``，各用各的时 ``各模型各自的全部起报日``。"""
+    if not _own_dates_mode(bundle):
+        return f"{len(bundle.dates)} 个共同日期"
+    return "各模型各自的全部起报日"
+
+
+def _date_span_word(bundle: EnsBundle) -> str:
+    """替代 ``{_date_span(dates)} 共同日期`` 那一截。
+
+    默认口径印出区间（``20250702 至 20250728 共同日期``）；各用各的时**没有**一个
+    能代表全体的区间，只留口径词——别硬编一个区间出来。
+    """
+    if not _own_dates_mode(bundle):
+        return f"{_date_span(bundle.dates)} 共同日期"
+    return "各模型各自的全部起报日"
+
+
+def _scope_counts(bundle: EnsBundle) -> str:
+    """各模型的天数清单（``AIFS 27 天、FGVP 228 天、…``），按模型名升序。
+
+    这正是「不公平」的地方，藏不得——所以每一个交代口径的句子都带上它。
+    默认口径下所有模型天数相同，清单没有信息量，调用方直接用 ``_scope_detail``。
+    """
+    return "、".join(
+        f"{name} {len(bundle.dates_by_model[name])} 天" for name in sorted(bundle.names)
+    )
+
+
+def _scope_detail(bundle: EnsBundle) -> str:
+    """正文里交代日期口径的那一句（带各模型的天数）。
+
+    两种口径都返回一个**自带括号**的短语，直接嵌进句子；各用各的时括号里就是
+    天数清单。要跟别的括号嵌套时改用 :func:`_scope_counts`，别把这个整个塞进去。
+    """
+    if not _own_dates_mode(bundle):
+        return f"{len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}）"
+    return f"各模型各自的全部起报日（{_scope_counts(bundle)}）"
+
+
+def _paired_frame(bundle: EnsBundle, frame: pd.DataFrame) -> pd.DataFrame:
+    """把一个逐日帧裁到共同日期，供「显著优胜」那类配对判断使用。
+
+    §4.1 / §4.2 的表里同时印**均值**和**显著优胜**：均值是各模型自己全部起报日上的
+    （各自的天数），显著优胜必须来自共同日期上的配对检验——两者口径不同是有意的，
+    表下会写明。各用各的时那个帧是并集 + NaN，直接送进 ``_wilcoxon_p`` 会让每一对
+    各自在自己的交集上检验，``Holm`` 校正的对象就不是同一批假设了。
+    """
+    frame = frame.reindex(index=[str(d) for d in bundle.dates])
+    return frame.dropna(how="any") if _own_dates_mode(bundle) else frame
+
+
+def _thin_models(bundle: EnsBundle) -> List[str]:
+    """自己的起报日数低于经验下限的模型（按天数升序）。
+
+    各用各的时，天少的那几个模型自己的平均值就不稳，这份名单要出现在风险一节；
+    默认口径下全体共享共同日期，没有「谁比谁少」这回事，返回空表。
+    """
+    if not _own_dates_mode(bundle):
+        return []
+    thin = [
+        (len(bundle.dates_by_model[name]), name)
+        for name in bundle.names
+        if len(bundle.dates_by_model[name]) < SMALL_SAMPLE_DATES
+    ]
+    return [name for _count, name in sorted(thin)]
+
+
 def _extreme(series: pd.Series, mode: str, digits: int = 3, suffix: str = "") -> str:
     """极值句里的「名字（数值）」——并列时逐个列出，与附表用同一套判据。
 
@@ -725,20 +852,41 @@ def _section_conclusion(
     ]
     if bundle.small_sample:
         items.append(
-            f"共同日期只有 {len(bundle.dates)} 天（少于 {SMALL_SAMPLE_DATES} 天），"
-            f"配对 Wilcoxon 检验的检验力很低，「无显著差异」多半是样本不够、"
-            f"而不是两者真的等价；本报告的排名只作方向性参考。"
+            f"第 6 节的配对检验只有 {len(bundle.dates)} 个共同日期可用"
+            f"（少于 {SMALL_SAMPLE_DATES} 天），Wilcoxon 检验的检验力很低，"
+            f"「无显著差异」多半是样本不够、而不是两者真的等价；"
+            f"本报告的排名只作方向性参考。"
+        )
+    if _own_dates_mode(bundle):
+        # 这是本报告最容易被读错的地方：表里的数来自不同时段，「谁更好」里有
+        # 多少是时段差异、多少是模型差异，本报告分不开。必须写在摘要里。
+        items.append(
+            f"日期口径：正文与附录中**每个模型都用各自全部起报日**"
+            f"（{_scope_counts(bundle)}），表里的均值来自**不同时段**，"
+            f"跨模型的相对位次因此同时包含模型差异与时段差异，"
+            f"**不是同一批日期上的公平对比**；只有第 6 节的配对检验退回 "
+            f"{len(bundle.dates)} 个共同日期（{_date_span(bundle.dates)}）。"
         )
     return [
         "# 1. 结论摘要",
         "",
         # 先交代评估基本信息（评的是谁、多少天、什么指标），再给结论
         f"本报告评估{'、'.join(sorted(names))}共{len(names)}个模型，"
-        f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
-        f"口径为集合平均场的RMSE、CRPS、ACC、FA与Spread/RMSE。"
-        f"正文与附录统一使用同一批共同日期，逐日结果按 lead 平均后比较，"
-        f"非共同日期不参与任何统计。确定性的单成员版本见 `weather_rmse_single` 报告，"
-        f"球谐带功率谱补充见 `weather_rmse_wave` 报告，三份报告口径不同、数字不可互相搬运。",
+        + (
+            f"覆盖{len(bundle.dates)}天（{_date_span(bundle.dates)}）；"
+            if not _own_dates_mode(bundle)
+            else f"覆盖时段不等长（{_scope_counts(bundle)}）；"
+        )
+        + f"口径为集合平均场的RMSE、CRPS、ACC、FA与Spread/RMSE。"
+        + (
+            "正文与附录统一使用同一批共同日期，逐日结果按 lead 平均后比较，"
+            "非共同日期不参与任何统计。"
+            if not _own_dates_mode(bundle)
+            else "正文与附录中每个模型都用自己的全部起报日——各自的平均、各自的天数，"
+            "因此各表各图并不是在同一批日期上对比（详见第 2 节与第 7 节）。"
+        )
+        + "确定性的单成员版本见 `weather_rmse_single` 报告，"
+        + "球谐带功率谱补充见 `weather_rmse_wave` 报告，三份报告口径不同、数字不可互相搬运。",
         "",
         # 结论并成一段而不是逐条列点：读起来是判断，不是清单
         "".join(items),
@@ -770,6 +918,10 @@ def _section_samples(bundle: EnsBundle) -> List[str]:
             str(n_dates) if n_dates is not None else "—",
             str(n_ok) if n_ok is not None else "—",
             str(len(archive.dates)),
+            # 「本次使用日期」= 这个模型真正进了统计的天数。各用各的时它就等于
+            # 「日期目录」，只用共同日期时它等于「有效共同日期」——两种口径下
+            # 读者都能一眼看出谁被砍了多少，不用去猜渲染器用了哪一套。
+            str(len(base.dates_by_model.get(name, []))),
             str(len(common)),
             str(member) if member is not None else "—",
             str(lead) if lead is not None else "—",
@@ -777,20 +929,31 @@ def _section_samples(bundle: EnsBundle) -> List[str]:
         ])
     any_failed = sum(1 for name in names if (base.archives[name].meta.get("failures") or []))
     rows.append([
-        "共同有效样本", "—", str(len(base.dates)), "—", str(len(base.dates)),
+        "共同有效样本", "—", str(len(base.dates)), "—", "—", str(len(base.dates)),
         bundle.member_label,
         str(len(base.rmse_by_lead[names[0]].index)),
         f"{any_failed} 个模型有失败起报点" if any_failed else "无",
     ])
     lines += _table(
         ["**模型**", "**请求日期**", "**成功日期**", "**日期目录**",
-         "**有效共同日期**", "**成员数**", "**Lead数**", "**失败情况**"],
+         "**本次使用日期**", "**有效共同日期**", "**成员数**", "**Lead数**", "**失败情况**"],
         rows,
     )
     lines += [""]
     lines += _bullets([
-        f"正文与附录统一使用 {len(base.dates)} 个共同日期（{_date_span(base.dates)}）；"
-        f"各模型的非共同日期不参与任何统计与曲线，因此各表样本量一致、可直接横向比较。",
+        # 上半段交代「本次统计到底用了哪几天」，下半段解释「有效共同日期」那一列
+        # 是给谁用的。两种口径下这句话必须能各说各话，所以整个按模式分叉。
+        (
+            f"正文与附录统一使用 {_scope_detail(base)}；"
+            f"各模型的非共同日期不参与任何统计与曲线，因此各表样本量一致、可直接横向比较。"
+            if not _own_dates_mode(bundle)
+            # 这里用 _scope_counts 而不是 _scope_detail：句子前半已经说了「用自己的
+            # 全部起报日」，再嵌一整句「各模型各自的全部起报日（…）」是重复。
+            else f"正文与附录中每个模型都用自己的全部起报日（{_scope_counts(base)}）。"
+            f"表中「本次使用日期」即该模型真正进了统计的天数（= 它的「日期目录」），"
+            f"**天数不同、时段也不同，各表之间的均值不可当作同一批日期的公平对比**；"
+            f"「有效共同日期」那一列是第 6 节配对检验能用的天数，只有它才是各模型共有的。"
+        ),
         f"「起报日数」「成功日期」取自各模型 ``scores.csv`` 里出现过的 ``init_date`` "
         f"其中全部行 ``status = success`` 的个数（新产物没有「请求日期」这个概念，"
         f"``n_dates`` 就是实际出了数的天数）。",
@@ -827,7 +990,7 @@ def _quality_notes(bundle: EnsBundle) -> List[str]:
         counts = "、".join(f"{name} {len(v)} 个" for name, v in declared.items())
         notes.append(
             f"变量覆盖按各模型配置里 ``var_metrics`` 的声明口径："
-            f"{counts}。报告只比较共同日期上**都真的算出来**的变量"
+            f"{counts}。报告只比较各模型**都真的算出来**的变量"
             f"（RMSE {len(base.common_variables)} 个：{_named(base.common_variables)}；"
             f"ACC {len(bundle.acc_variables)} 个：{_named(bundle.acc_variables)}；"
             f"FA {len(base.fa_variables)} 个：{_named(base.fa_variables)}）。"
@@ -868,8 +1031,20 @@ def _quality_notes(bundle: EnsBundle) -> List[str]:
 
     if bundle.small_sample:
         notes.append(
-            f"共同日期仅 {len(base.dates)} 天，低于 {SMALL_SAMPLE_DATES} 天的经验下限，"
-            f"配对检验与分时效段均值都不稳定，**不要**据此写结论。"
+            f"配对检验可用的共同日期仅 {len(base.dates)} 天，低于 {SMALL_SAMPLE_DATES} "
+            f"天的经验下限，第 6 节的配对检验不稳定，**不要**据此写结论。"
+        )
+    thin = _thin_models(bundle)
+    if thin:
+        # 各用各的时，「天数少的那几个模型自己的平均值不稳」和「配对检验样本不够」
+        # 是两件独立的事，摘要里那句只说后者，这里补前者。
+        detail = "、".join(
+            f"{name} {len(bundle.dates_by_model[name])} 天" for name in thin
+        )
+        notes.append(
+            f"**这些模型自己的起报日数低于 {SMALL_SAMPLE_DATES} 天的经验下限：{detail}**。"
+            f"它们的每一个均值都只由这些天平均出来，与长时段模型的数值波动不在一个量级；"
+            f"跨模型比大小前先看这一条。"
         )
     return notes
 
@@ -959,7 +1134,8 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
         rmse_rows.append(
             [variable]
             + [_fmt(frame[name].mean(), 4) for name in names]
-            + [_dominant(frame, names)]
+            # 均值取上表那个帧（各自全部起报日），显著优胜取共同日期上的配对检验
+            + [_dominant(_paired_frame(bundle, frame), names)]
         )
     lines += _table(["**变量**"] + list(names) + ["**显著优胜**"], rmse_rows)
 
@@ -974,7 +1150,8 @@ def _section_overall(bundle: EnsBundle) -> List[str]:
             acc_rows.append(
                 [variable]
                 + [_fmt(frame[name].mean(), 2) for name in names]
-                + [_dominant(frame, names, higher_is_better=True)]
+                # 同 §4.1：均值取各自全部起报日，显著优胜取共同日期
+                + [_dominant(_paired_frame(bundle, frame), names, higher_is_better=True)]
             )
         lines += _table(["**变量**"] + list(names) + ["**显著优胜**"], acc_rows)
         lines += [""]
@@ -1081,9 +1258,16 @@ def _overall_notes(bundle: EnsBundle) -> List[str]:
             f"{_named(crps_best)}——集合平均场精度与集合分布质量不是同一件事，"
             f"选型时要说明以哪一个为准。"
         )
+    if _own_dates_mode(bundle):
+        items.append(
+            f"口径提醒：本节各列是**各模型自己全部起报日**上的平均"
+            f"（{_scope_counts(bundle)}），不是同一批日期；"
+            f"下表的相对位次里混着时段差异，第 6 节才是在共同日期上的配对检验。"
+        )
     if bundle.small_sample:
         items.append(
-            f"共同日期只有 {len(bundle.dates)} 天，上述排序的方向性高于显著性，不要当成定论。"
+            f"配对检验可用的共同日期只有 {len(bundle.dates)} 天，"
+            f"上述排序的方向性高于显著性，不要当成定论。"
         )
     return items
 
@@ -1257,6 +1441,16 @@ def _section_tests(bundle: EnsBundle) -> List[str]:
         f"Holm p < 0.05 才记「显著」。检验用的是逐日样本而不是平均后的单点，"
         f"所以样本量等于共同日期数。RMSE / CRPS / FA 偏差 / Spread-RMSE 距 1 都是"
         f"越小越好，ACC 越大越好。「指标族」= 同一类指标、项 = 变量。",
+    ]
+    if _own_dates_mode(bundle):
+        lines += [
+            "",
+            f"**本节是全报告唯一在共同日期上做的比较**：正文第 4、5 节各表的均值来自"
+            f"各模型自己的全部起报日（{_scope_counts(base)}），与本节的样本不是同一批，"
+            f"表里的均值也**不会**等于本节检验时的均值——配对检验要求两边在同一天有数，"
+            f"日期对不齐的样本对 Wilcoxon 没有意义。",
+        ]
+    lines += [
         "",
         "**分指标族显著优胜项汇总**",
         "",
@@ -1308,8 +1502,8 @@ def _test_notes(bundle: EnsBundle) -> List[str]:
     )
     if bundle.small_sample:
         items.append(
-            f"共同日期仅 {total_dates} 天：Wilcoxon 符号秩检验在 n < {SMALL_SAMPLE_DATES} "
-            f"时几乎检验不出差异（n = {total_dates} 时理论最小两侧 p 值约 "
+            f"配对检验可用的共同日期仅 {total_dates} 天：Wilcoxon 符号秩检验在 "
+            f"n < {SMALL_SAMPLE_DATES} 时几乎检验不出差异（n = {total_dates} 时理论最小两侧 p 值约 "
             f"{2.0 / (2 ** total_dates):.2e}，但需要全部样本同号才可能达到），"
             f"「无显著差异」不能读成「两者等价」。"
         )
@@ -1325,22 +1519,50 @@ def _section_risks(bundle: EnsBundle) -> List[str]:
     base = bundle.base
     names = bundle.names
     items = [
-        f"样本量：全部统计基于 {len(base.dates)} 个共同日期"
-        f"（{_date_span(base.dates)}），分时效段的每个点又只有其中一个子集，"
-        f"越靠后的时效样本越少，末端时效的曲线波动要谨慎解读。",
-        f"口径边界：正文与附录只使用共同日期。各模型产物里还有大量非共同日期"
-        f"（起报日数远多于共同日期的那些模型尤其明显），本报告**没有**使用它们，"
-        f"因此不要把本报告的数字与各模型单独跑出来的汇总数直接对比。",
+        # 第一句说「正文各表的数是从哪些天来的」，第二句说「配对检验用的是哪些天」。
+        # 各用各的时这两拨天不是同一批，分开写清楚，别让读者以为是同一套。
+        (
+            f"样本量：正文与附录各表的统计基于 {_scope_detail(base)}，"
+            f"分时效段的每个点又只有其中一个子集，越靠后的时效样本越少，"
+            f"末端时效的曲线波动要谨慎解读。"
+            if not _own_dates_mode(bundle)
+            else f"样本量：正文与附录各表**每个模型用各自全部起报日**"
+            f"（{_scope_counts(base)}），天数最少的那几个模型的曲线与均值波动"
+            f"天然比其余模型大；分时效段的每个点又只有各自日期里的一个子集，"
+            f"越靠后的时效样本越少，末端时效的曲线波动要谨慎解读。"
+        ),
+        (
+            f"口径边界：正文与附录只使用共同日期。各模型产物里还有大量非共同日期"
+            f"（起报日数远多于共同日期的那些模型尤其明显），本报告**没有**使用它们，"
+            f"因此不要把本报告的数字与各模型单独跑出来的汇总数直接对比。"
+            if not _own_dates_mode(bundle)
+            else f"口径边界：正文与附录**每个模型用各自全部起报日**，"
+            f"因此同表里各列来自不同时段，位次里混着时段差异——"
+            f"这是明知不公平仍直接对比的做法，**不构成同口径结论**；"
+            f"唯一同口径的部分是第 6 节在 {len(base.dates)} 个共同日期上的配对检验。"
+            f"正式验收前应把各批 ``periods`` 对齐后重跑。"
+        ),
         f"集合平均场口径：RMSE / ACC / FA 都取自集合平均场（``product_kind`` 为 "
         f"``deterministic`` 的那批结果），衡量的是集合平均场而不是最优成员；"
         f"择优成员带来的收益在本报告中不可见。",
         f"对数底数：本报告的纬向谱偏差用 ln，``weather_rmse_single`` 报告的"
         f"「频谱对数 RMS」用 log10，数值相差 2.3026 倍，跨报告比大小前先统一底数。",
     ]
+    if _own_dates_mode(bundle):
+        thin = _thin_models(bundle)
+        if thin:
+            detail = "、".join(
+                f"{name} 只有 {len(bundle.dates_by_model[name])} 天" for name in thin
+            )
+            items.append(
+                f"**样本量最少的模型：{detail}**（低于 {SMALL_SAMPLE_DATES} 天的经验下限）。"
+                f"它们的均值由这些天平均而来，与长时段模型比大小前先看这一条；"
+                f"要公平结论就把各批时段对齐后重跑。"
+            )
     if bundle.small_sample:
         items.append(
-            f"**共同日期只有 {len(base.dates)} 天**，本报告不构成任何模型优劣的结论，"
-            f"只能用于验证链路与看曲线形状。"
+            f"**配对检验可用的共同日期只有 {len(base.dates)} 天**，"
+            f"第 6 节的显著性检验不构成任何模型优劣的结论，只能用于看方向。"
         )
     gaps = sorted(set(base.fa_variables) ^ set(base.common_variables))
     if gaps:
@@ -1383,10 +1605,19 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
     return [
         "# 附录：集合预报曲线图",
         "",
-        f"本附录使用{count}个模型共同的{len(base.dates)}个日期"
-        f"（{base.dates[0]} 至 {base.dates[-1]}）。"
-        f"以下每张图均包含{shown}{count}条模型曲线。"
-        f"正文统计表与图中曲线使用同一批共同日期。",
+        (
+            f"本附录使用{count}个模型共同的{len(base.dates)}个日期"
+            f"（{base.dates[0]} 至 {base.dates[-1]}）。"
+            f"以下每张图均包含{shown}{count}条模型曲线。"
+            f"正文统计表与图中曲线使用同一批共同日期。"
+            if not _own_dates_mode(bundle)
+            else f"本附录中**每个模型画的是自己全部起报日上的平均**"
+            f"（{_scope_counts(base)}），"
+            f"因此同一条曲线在不同模型上的日期范围并不相同，"
+            f"曲线高低里同时含模型差异与时段差异。"
+            f"以下每张图均包含{shown}{count}条模型曲线。"
+            f"本附录与正文第 4、5 节同口径；第 6 节的配对检验另用共同日期，与本附录不同源。"
+        ),
         "",
         f"## 附 1 集合均值RMSE：{len(base.common_variables)}个变量{count}模型曲线",
         "",
@@ -1395,7 +1626,7 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"![ensemble_rmse_vs_lead]({figures['ensemble_rmse_vs_lead']})",
         "",
         f"图 1：{len(base.common_variables)}个变量上{shown}的集合均值 RMSE 随 lead 变化"
-        f"（{len(base.dates)} 个共同日期平均）。",
+        f"（{_date_word(bundle)}平均）。",
         "",
         f"## 附 2 Spread / Ensemble-mean RMSE：{len(bundle.spread_variables)}个变量{count}模型曲线",
         "",
@@ -1404,7 +1635,7 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"![ensemble_spread_rmse_ratio_vs_lead]({figures['ensemble_spread_rmse_ratio_vs_lead']})",
         "",
         f"图 2：{len(bundle.spread_variables)}个变量的 Spread / Ensemble-mean RMSE 随 lead "
-        f"变化（{len(base.dates)} 个共同日期平均），虚线为理想值 1。",
+        f"变化（{_date_word(bundle)}平均），虚线为理想值 1。",
         "",
         f"## 附 3 {crps_shown} CRPS：{count}模型曲线",
         "",
@@ -1412,7 +1643,7 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         "",
         f"![ensemble_crps_vs_lead]({figures['ensemble_crps_vs_lead']})",
         "",
-        f"图 3：{crps_shown} 的 CRPS 随 lead 变化（{len(base.dates)} 个共同日期平均），"
+        f"图 3：{crps_shown} 的 CRPS 随 lead 变化（{_date_word(bundle)}平均），"
         f"越低越好。",
         "",
         f"## 附 4 {acc_shown} ACC：{count}模型曲线",
@@ -1421,7 +1652,7 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         "",
         f"![ensemble_acc_vs_lead]({figures['ensemble_acc_vs_lead']})",
         "",
-        f"图 4：{acc_shown} 的 ACC 随 lead 变化（{len(base.dates)} 个共同日期平均），"
+        f"图 4：{acc_shown} 的 ACC 随 lead 变化（{_date_word(bundle)}平均），"
         f"越高越好。",
         "",
         f"## 附 5 FA（Forecast Activity）：{len(base.fa_variables)}个变量、"
@@ -1442,7 +1673,7 @@ def _appendix(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"![ensemble_spectrum]({figures['ensemble_spectrum']})",
         "",
         f"图 6：{_named(base.spectrum_variables)} 的纬向功率谱"
-        f"（双对数，{len(base.dates)} 个共同日期平均），"
+        f"（双对数，{_date_word(bundle)}平均），"
         f"每条颜色曲线为一个模型的预测谱，黑色虚线为观测谱。",
         "",
     ] + _heatmap_block(bundle, figures) + [""] \
@@ -1479,7 +1710,7 @@ def _heatmap_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         f"![ensemble_rmse_heatmap]({figures['rmse_heatmap']})",
         "",
         f"图 7：{variables}个变量 × {leads}个 lead 的 RMSE 倍数热力图"
-        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span(base.dates)} 共同日期平均）",
+        f"（各自除以本模型首时效 {first}h 的 RMSE；{_date_span_word(bundle)}平均）",
     ]
 
 
@@ -1491,7 +1722,7 @@ def _single_init_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[st
     lines = [
         f"## 附 8 单起报 {variable} 功率谱曲线",
         "",
-        f"附 6 是{len(base.dates)}个日期平均后的谱，平均会把个例差异抹平。这一节换成"
+        f"附 6 是{_date_word(bundle)}平均后的谱，平均会把个例差异抹平。这一节换成"
         f"**单个起报**（{init}）的谱，用来核对平均谱上的结论在个例上是否成立——平均谱上"
         "「小尺度偏低」如果只在少数个例出现，就不该写成模式的普遍特征。集合平均谱本身的",
         "平滑也会掩盖成员间的谱差异，个例图里谱线更毛糙是正常的。",
@@ -1610,7 +1841,7 @@ def _capability_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str
             f"![capability_radar]({figures['capability_radar']})",
             "",
             f"图 9：{_model_count_word(len(names))}模型能力雷达图（{len(kept)} 根综合评分轴；"
-            f"各轴批内 min-max 归一化，1 = 本批最好；{_date_span(base.dates)} 共同日期）",
+            f"各轴批内 min-max 归一化，1 = 本批最好；{_date_span_word(bundle)}）",
         ]
     else:
         lines += [
@@ -1723,12 +1954,12 @@ def _region_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
         "",
         f"图 L1：各纬度带集合均值 RMSE 的相对值随 lead 变化"
         f"（各自除以本带基线，100 = 该带内{count}模型几何均值；"
-        f"{len(base.dates)} 个共同日期平均）。",
+        f"{_date_word(bundle)}平均）。",
         "",
         f"![lat_band_summary]({figures['lat_band_summary']})",
         "",
         f"图 L2：分纬度带综合相对 RMSE"
-        f"（100 = 该带内{count}模型几何均值；{len(base.dates)} 个共同日期平均）。",
+        f"（100 = 该带内{count}模型几何均值；{_date_word(bundle)}平均）。",
     ]
     if has_spread:
         lines += [
@@ -1736,7 +1967,7 @@ def _region_block(bundle: EnsBundle, figures: Mapping[str, str]) -> List[str]:
             f"![lat_band_spread_ratio]({figures['lat_band_spread_ratio']})",
             "",
             f"图 L3：分纬度带平均 Spread / Ensemble-mean RMSE"
-            f"（虚线为理想值 1；{len(base.dates)} 个共同日期平均）。",
+            f"（虚线为理想值 1；{_date_word(bundle)}平均）。",
         ]
     return lines
 
@@ -1906,17 +2137,33 @@ def render_ens(bundle: EnsBundle, figures: Mapping[str, str], *,
 
 
 def build_ens_report(archives: Sequence[Archive], out_dir: Path, *,
-                     archive: Optional[str] = None) -> Dict[str, Path]:
-    """出图 + 写 ``REPORT.md``，返回产物名 → 路径。"""
+                     archive: Optional[str] = None,
+                     members: Optional[int] = None,
+                     own_dates: bool = False) -> Dict[str, Path]:
+    """出图 + 写 ``REPORT.md``，返回产物名 → 路径。
+
+    ``members`` 是命令行给的集合成员数（见 :func:`analyze_ens`）：产物里没有这个
+    字段，不给就渲染成「—」。
+
+    ``own_dates`` 让每个模型按自己的全部起报日统计（见 :func:`analyze_ens`）。
+    各模型覆盖时段差很多、又不想为了对齐而丢数据时开它——报告里会点名各用了多少天、
+    以及基线跨了不同时段这件事。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle = analyze_ens(archives)
+    bundle = analyze_ens(archives, members=members, own_dates=own_dates)
     names = bundle.names
     base = bundle.base
     count = _cn(len(names))
     first, last, _ = _lead_span(base.rmse_by_lead[names[0]].index)
-    date_note = f"{len(base.dates)} 个共同日期平均（{_date_span(base.dates)}）"
+    # 图标题里那截日期口径。各用各的时**不能**印一个区间——每个模型的区间都不同，
+    # 随便挑一个印出来就是假的。默认口径逐字保持原样。
+    date_note = (
+        f"{len(base.dates)} 个共同日期平均（{_date_span(base.dates)}）"
+        if not _own_dates_mode(bundle)
+        else "各模型各自的全部起报日平均"
+    )
 
     # 插入顺序 = 图号顺序，与骨架「附 1」…「附 6」一一对应
     figures = {

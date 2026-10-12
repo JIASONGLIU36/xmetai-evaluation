@@ -21,6 +21,10 @@
 
     --result DIR       报告输出目录（必给，不存在会建）
     --archive TEXT  归档名，写进报告抬头
+    --members N     集合成员数，对所有模型一律用它。产物里没记这个字段
+                    （长表记的是算出来的数，不是运行参数），不给就渲染成「—」
+    --own-dates     每个模型按自己的全部起报日统计（默认只用共同日期）。
+                    各模型覆盖时段差很多时用它；§6 的配对检验永远只在共同日期上做
 
 **与 `_single` 支线的差别（选错入口会静默算错）**：
 
@@ -80,6 +84,18 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--result", type=Path, required=True, help="报告输出目录")
     parser.add_argument("--archive", default=None, help="归档名，写进报告抬头")
+    parser.add_argument(
+        "--members", type=int, default=None,
+        help="集合成员数。产物的长表里没有这个字段（它记的是算出来的数，不是运行参数），"
+        "不给就渲染成「—」。这批五份都是 51，填 51",
+    )
+    parser.add_argument(
+        "--own-dates", action="store_true",
+        help="每个模型按**自己的全部起报日**统计，而不是只用共同日期。各模型覆盖时段"
+        "差很多时用它，免得为了对齐把长的那几份砍到最短的那份；代价是基线（跨模型"
+        "几何均值）在拿不同时段的平均比，报告里会点名。配对检验（§6）不受影响，"
+        "它永远只在共同日期上做。不给就是老口径：全部统计只用共同日期",
+    )
     args = parser.parse_args(argv)
 
     models = []
@@ -99,7 +115,10 @@ def main(argv=None) -> int:
     from xmetai_evaluation.visualization.ens_report import build_ens_report
 
     archives = [load_archive(name, directory) for name, directory in models]
-    artifacts = build_ens_report(archives, args.result, archive=args.archive)
+    artifacts = build_ens_report(
+        archives, args.result, archive=args.archive,
+        members=args.members, own_dates=args.own_dates,
+    )
 
     print(f"\n产出 {len(artifacts)} 个文件：")
     for name, path in artifacts.items():

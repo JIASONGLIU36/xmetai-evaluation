@@ -77,7 +77,7 @@ METRIC_OPTIONS["spread_error"] = {**METRIC_OPTIONS["spread_error"], "ddof": 0}
 _ERA5_STORE_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 cfg = EvalConfig(
-    name="weather_rmse_ens_fuxi",
+    name="weather_rmse_ens_fgvp",
     description="集合场检验（FuXi 集合 × ERA5）：z500/msl/u200/v200/ws200 的 RMSE / CRPS / ACC / 活跃度 / 谱 / 球谐带功率",
     # 走哪套流程模板。模板 = 协议 + 变换 + 指标的预设组合（全部可选值
     # `xmetai-eval --list-pipelines`）。本流程 = grid_valid_time 协议 +
@@ -135,16 +135,56 @@ cfg = EvalConfig(
         "smooth_days": 15,  # ±7.5 天中心滑动、跨年首尾相接，抹平单日气候态噪声
     },
 
-    # 评测时段（YYYYMMDD 或 YYYYMMDDHH），只管起报日的范围；观测/参考读
-    # 多少由框架按时效跨度自己算。当前是冒烟小区间，正式跑改这两行。
-    start_date=os.environ.get("START_DATE", "20250102"),
-    end_date=os.environ.get("END_DATE", "20251215"),
+    # ── 评测时段（periods 与 start_date/end_date **二选一**，同时给会报配置错）──
+    # 当前跑五段：起报日共 228 个 × 16 个时效窗 = **3648 块**。五段的结果汇成
+    # **一套**统计量（每个 变量×指标×时效只有一行，不是每段各一行）；段与段之间
+    # 的空档**不切块、不出样本**。换回单时段：把这行注掉、把下面 start_date/
+    # end_date 两行解开。
+    #
+    # 五段 = ``fgvp_ens_merged`` 里**完整**的起报日（2025-11-19 体检清单实测）：
+    #     20250102 .. 20250411  100 天
+    #     20250504 .. 20250518   15 天
+    #     20250702 .. 20250721   20 天
+    #     20250723 .. 20251007   77 天
+    #     20251104 .. 20251119   16 天      共 228 天
+    # 目录里另有 48 天是**残缺**的（缺成员目录 / 缺步文件），**不能放进来**：
+    #   ``io/gridded.py`` 里 ``lead_from="index"`` 的布局不按文件名推时效，按
+    #   "该成员目录里找到的第几个文件"推（``(position+1)*step_hours``）——成员
+    #   中间缺一个步文件，它后面所有时效**整体前移一格**（021.nc 被当成 L120），
+    #   不报错也不告警（``_warn_on_member_mismatch`` 只比成员数，且单日起报比不
+    #   出来）。残缺日补齐后（``check_merge_ens.py --copy/--move``）可以并回来。
+    #
+    # ⚠ 起报日从 8 个涨到 228 个，单块内存不变（块口径是"1 起报日 × 1 天时效"），
+    #   但**下面内存备注里那条"换回全量表必须降 n_workers"现在真的生效了**：
+    #   VARS 是本文件的 5 要素表（不是 z500 冒烟态），按那条备注气候态 resident
+    #   会到 ~67G、窗缓存 ~95G，n_workers=24 是 400G 量级。跑之前先按机器内存
+    #   把 n_workers 降到 8~12，或把 observation 退回 slice。
+    #
+    # ✓ 本配置**不会**为空档期多读观测，这点与站点协议的两个 config 不同。
+    #   grid_valid_time 的观测时刻是按实际 (起报 × 时效) 现算的
+    #   （execution/plan.py 的 ``_grid_valid_times``），空档期算不出任何有效时刻，
+    #   ERA5 侧一个请求都不会发。站点协议的 ``station_observation_span`` 取的是
+    #   「最早起报 → 最晚起报」的连续包络，那边空档才会被照读。同一份 periods
+    #   在两种协议下观测读量不同，这是协议口径的差别，不是配置的问题。
+    #   （observation 的 window:16 滚动缓存跨过 4 道空档时会落空重读，
+    #    只是那几天边界缓存，与空档跨度无关。）
+    periods=[
+        ("20250102", "20250411"),   # 100 天
+        ("20250504", "20250518"),   #  15 天
+        ("20250702", "20250721"),   #  20 天（7/22 残缺，单独剔在外面）
+        ("20250723", "20251007"),   #  77 天
+        ("20251104", "20251119"),   #  16 天
+    ],
+
+    # 单时段写法（当前未启用）：
+    # start_date=os.environ.get("START_DATE", "20250102"),
+    # end_date=os.environ.get("END_DATE", "20251215"),
     limit=None,  # 限起报数：冒烟改 2；None = 不限。改回 None 重跑时 resume
                  # 会复用冒烟算过的块，不白算
 
     output_dir=os.environ.get(
         "EVAL_OUTPUT",
-        "/workspace/szwCode/xmetai-evaluate/evaluation_results/weather_rmse_ens_fgvp",
+        "/workspace/szwCode/evaluation_results/weather_rmse_ens_fgvp",
     ),
     metric_options=METRIC_OPTIONS,
     log_level="INFO",  # DEBUG / INFO / WARNING / ERROR
@@ -178,9 +218,9 @@ cfg = EvalConfig(
         # 下面是经典三分带（热带 ±20° + 两半球中高纬，拼满全球不重叠），
         # 改边界直接改数字。
         "regions": {
-            "tropics": {"lat_min": -20, "lat_max": 20},
-            "nh_extratropics": {"lat_min": 20, "lat_max": 90},
-            "sh_extratropics": {"lat_min": -90, "lat_max": -20},
+            # "tropics": {"lat_min": -20, "lat_max": 20},
+            # "nh_extratropics": {"lat_min": 20, "lat_max": 90},
+            # "sh_extratropics": {"lat_min": -90, "lat_max": -20},
         },
     },
 

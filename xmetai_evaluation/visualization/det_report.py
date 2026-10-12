@@ -678,7 +678,11 @@ class Bundle(NamedTuple):
 
     names: List[str]
     archives: Dict[str, Archive]
-    dates: List[str]
+    dates: List[str]  # 共同日期（配对检验与 §2「有效共同日期」那一行用）
+    #: 模型 -> 该模型**本次统计实际用的**起报日。默认等于 ``dates``（共同日期）；
+    #: ``own_dates=True`` 时是各模型自己的全部起报日，长度可以互不相同。
+    #: 凡是要给**单个模型**算平均的地方都读这里，别读 ``dates``。
+    dates_by_model: Dict[str, List[str]]
     common_variables: List[str]
     acc_variable: str
     fa_variables: List[str]
@@ -731,12 +735,23 @@ def analyze(
     archives: Sequence[Archive],
     *,
     declared: Optional[Mapping[str, Sequence[str]]] = None,
+    own_dates: bool = False,
 ) -> Bundle:
     """把 N 份产物算成一份 :class:`Bundle`。
 
+    Args:
+        declared: 调用方声明的共同变量，``None`` 表示由产物自己定。
+        own_dates: ``False``（默认）时每个模型的每一项统计都只在**共同日期**上算
+            ——各模型覆盖的时段不同时，比的是同一批日子。
+            ``True`` 时每个模型的统计与曲线用**它自己的全部起报日**（各自的平均值、
+            各自的天数），只有**配对检验**仍退回共同日期：日期不对齐的样本做不了
+            Wilcoxon。这条路径用于各模型覆盖时段差很多、又要直接对比的情形——
+            此时基线（跨模型的几何均值）是拿不同时段的平均在比，**不公平但看得见**，
+            报告里必须点名（见 :mod:`ens_report` 的 §1/§2/§7）。
+
     Raises:
         ValueError: 共同日期太少（< 2）或没有共享的 RMSE 变量。
-        FileNotFoundError: 共同日期上缺逐日文件——不静默跳过。
+        FileNotFoundError: 用到的日期上缺逐日文件——不静默跳过。
     """
     if len(archives) < 2:
         raise ValueError("多模型报告至少要两个模型")
@@ -745,6 +760,17 @@ def analyze(
     dates = common_dates(archives)
     if len(dates) < 2:
         raise ValueError(f"共同日期只有 {len(dates)} 天，做不了配对检验: {dates}")
+    # 每个模型「本次统计实际用哪几天」。own_dates=False 时所有模型都是共同日期，
+    # 逐字保持既有行为；True 时各用各的，长度可以不一样。
+    dates_by_model = {
+        archive.name: (list(archive.dates) if own_dates else dates) for archive in archives
+    }
+    if own_dates:
+        # 配对检验要有足够的共同日期才有意义；共同日期本身在 :func:`common_dates`
+        # 那里已经保证 ≥2，这里只负责让「谁的天数太少」这件事在报告里说得出来。
+        empty = [name for name, own in dates_by_model.items() if not own]
+        if empty:
+            raise ValueError(f"这些模型自己的起报日为空，算不出任何统计: {empty}")
 
     # --- 变量集：所有模型 summary 里都有、且真的算出了数的 RMSE 变量 ---
     shared = set(rmse_mean_columns(archives[0].summary))
@@ -761,16 +787,23 @@ def analyze(
     for archive in archives:
         indexed = archive.summary.set_index("init_date")
         columns = {v: pd.to_numeric(indexed[f"rmse_{v}_mean"], errors="coerce") for v in variables}
-        rmse_by_date[archive.name] = pd.DataFrame(columns).reindex(index=dates)
+        rmse_by_date[archive.name] = pd.DataFrame(columns).reindex(
+            index=dates_by_model[archive.name]
+        )
 
     # --- 逐日文件（缺就报错，不静默跳过）---
     # acc_<date>_det.csv 里存的是相关系数本身（-1..1），报告统一按百分数呈现，
     # 所以在入口乘 100，下游（表、图、检验）拿到的都是 %。
     acc_by_lead = {
-        a.name: load_by_lead(a.root, "acc", dates, a.name) * BASELINE for a in archives
+        a.name: load_by_lead(a.root, "acc", dates_by_model[a.name], a.name) * BASELINE
+        for a in archives
     }
-    fa_ratio_by_lead = {a.name: load_fa_ratio(a.root, dates, a.name) for a in archives}
-    rmse_by_lead = {a.name: load_by_lead(a.root, "rmse", dates, a.name) for a in archives}
+    fa_ratio_by_lead = {
+        a.name: load_fa_ratio(a.root, dates_by_model[a.name], a.name) for a in archives
+    }
+    rmse_by_lead = {
+        a.name: load_by_lead(a.root, "rmse", dates_by_model[a.name], a.name) for a in archives
+    }
 
     acc_columns = set(acc_by_lead[names[0]].columns)
     for name in names[1:]:
@@ -799,7 +832,9 @@ def analyze(
     spectrum: Dict[str, pd.DataFrame] = {}
     spectrum_rms_values: Dict[str, float] = {}
     for archive in archives:
-        pred, obs = load_spectrum(archive.root, dates, spectrum_variable, archive.name)
+        pred, obs = load_spectrum(
+            archive.root, dates_by_model[archive.name], spectrum_variable, archive.name
+        )
         spectrum[archive.name] = pd.DataFrame({"pred": pred.mean(axis=1), "obs": obs.mean(axis=1)})
         per_date = []
         for date in pred.columns:
@@ -812,24 +847,39 @@ def analyze(
         spectrum_rms_values[archive.name] = BASELINE * float(np.mean(per_date)) if per_date else float("nan")
 
     # --- 派生指标 ---
+    # 跨模型的**几何均值基线**（``_relative`` 的分母）逐行算，所以每一行（变量／日期）
+    # 必须所有模型都在场，否则这一行的基线是拿残缺的模型集算的。own_dates=True 时
+    # 各模型天数不同，**只有配对检验那些帧**需要按下面的 ``_paired`` 裁齐，
+    # 按变量取平均的 ``mean_rmse`` 不受影响：每个模型各自的均值都在。
     mean_rmse = pd.DataFrame({name: rmse_by_date[name].mean(axis=0) for name in names}).reindex(variables)
     relative = _relative(mean_rmse)
     relative_composite = _composite(relative)
 
+    #: 逐日配对帧统一走这个：裁到共同日期；``own_dates`` 时还要把任何模型缺数的
+    #: 那一天整行丢掉——日期不齐会让「谁跟谁配对」这件事说不清。默认路径
+    #: **不丢**，逐字保持既有行为。
+    def _pair(frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.reindex(index=[str(d) for d in dates])
+        return frame.dropna(how="any") if own_dates else frame
+
     per_variable_relative = {}
     for variable in variables:
         columns = {name: rmse_by_date[name][variable] for name in names}
-        per_variable_relative[variable] = _relative(pd.DataFrame(columns).reindex(index=dates))
+        per_variable_relative[variable] = _relative(_pair(pd.DataFrame(columns))).reindex(index=dates)
     per_date_relative = sum(per_variable_relative.values()) / len(variables)
+    # ``per_variable_rmse`` 进 Bundle，§4.1 拿它的**均值**填表——own_dates 时那就是
+    # 各模型自己的全部日期；「显著优胜」那一列另由共同日期上的检验给，
+    # 两者口径不同，报告里写明。
     per_variable_rmse = {
-        variable: pd.DataFrame({name: rmse_by_date[name][variable] for name in names}).reindex(index=dates)
+        variable: pd.DataFrame({name: rmse_by_date[name][variable] for name in names})
         for variable in variables
     }
 
     # 逐日 ACC 直接读逐日文件，而不是从"先按 lead 平均、再按日期平均"的表里取——
     # 两者数值上等价，但配对检验要的是逐日样本，不能只有均值。
     per_date_acc = pd.DataFrame({
-        name: _acc_by_date(by_name[name].root, dates, acc_variable, name) for name in names
+        name: _acc_by_date(by_name[name].root, dates_by_model[name], acc_variable, name)
+        for name in names
     })
     acc_mean = per_date_acc.mean(axis=0)
 
@@ -846,9 +896,13 @@ def analyze(
         + _rank(spectrum_rms)
     ) / 4.0
 
+    # 检验一律在共同日期上做（见上方 ``_pair``）：§6 表里印的均值因此是**共同日期**
+    # 上的均值，与 §4 各模型全量日期的均值**不是同一个数**，报告里两处都写明。
     overall_tests = paired_tests(per_date_relative)
-    acc_tests = paired_tests(per_date_acc, higher_is_better=True)
-    win_counts = variable_win_counts(per_variable_rmse, names)
+    acc_tests = paired_tests(_pair(per_date_acc), higher_is_better=True)
+    win_counts = variable_win_counts(
+        {v: _pair(frame) for v, frame in per_variable_rmse.items()}, names
+    )
 
     anomaly_variable, anomaly_model, anomaly_ratio = _detect_anomaly(mean_rmse, names)
     lead_relative = _lead_relative(rmse_by_lead, names, variables)
@@ -866,7 +920,9 @@ def analyze(
     region_note = ""
     for region in region_list:
         own_models = {
-            archive.name: region_rmse_by_date(archive.root, region, dates)
+            archive.name: region_rmse_by_date(
+                archive.root, region, dates_by_model[archive.name]
+            )
             .reindex(columns=variables).mean(axis=0)
             for archive in archives
         }
@@ -874,7 +930,9 @@ def analyze(
         # 除成本带基线之后，「哪个模型在这个带上更稳」才是可比的。
         per_region_composite[region] = _composite(_relative(pd.DataFrame(own_models).reindex(index=variables)))
         region_rmse_by_lead[region] = {
-            archive.name: _metric_by_lead(archive.root, "rmse", dates, archive.name, region=region)
+            archive.name: _metric_by_lead(
+                archive.root, "rmse", dates_by_model[archive.name], archive.name, region=region
+            )
             for archive in archives
         }
         region_lead_relative[region] = _lead_relative(region_rmse_by_lead[region], names, variables)
@@ -887,7 +945,8 @@ def analyze(
     region_relative_composite = pd.DataFrame(per_region_composite).T
 
     return Bundle(
-        names=names, archives=by_name, dates=dates, common_variables=variables,
+        names=names, archives=by_name, dates=dates, dates_by_model=dates_by_model,
+        common_variables=variables,
         acc_variable=acc_variable, fa_variables=fa_variables,
         spectrum_variable=spectrum_variable, spectrum_variables=spectrum_vars,
         rmse_by_date=rmse_by_date, acc_by_lead=acc_by_lead, fa_ratio_by_lead=fa_ratio_by_lead,

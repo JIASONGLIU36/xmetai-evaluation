@@ -34,6 +34,7 @@ from xmetai_evaluation.visualization.ts_report import (
     box_stats,
     build_ts_report,
     collect_box_models,
+    load_probability,
     ordered_grades,
 )
 
@@ -481,8 +482,17 @@ class PrecipitationPlotter:
         sources: Optional[Dict[str, str]] = None,
         change_description: Optional[str] = None,
         region_labels: Optional[Dict[str, str]] = None,
+        probability: Optional[Dict[str, pd.DataFrame]] = None,
+        members: Optional[int] = None,
+        coverage: Optional[Dict[str, int]] = None,
+        ensemble: bool = False,
     ) -> Dict[str, Path]:
-        """出图 + 写 Markdown 报告，返回 {名称: 路径}。"""
+        """出图 + 写 Markdown 报告，返回 {名称: 路径}。
+
+        ``probability`` / ``members`` / ``coverage`` / ``ensemble`` 是集合产物
+        专属的，原样透传给 :func:`ts_report.build_ts_report`；确定性产物一个都
+        不用给（全为默认值时报告的每一个字节与以前一致）。
+        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         data = prepare_ts_dataframe(df)
@@ -547,6 +557,30 @@ class PrecipitationPlotter:
             plt.close()
             artifacts["performance_diagram"] = perf_path
 
+        # 概率评分那张图：窗口取**概率表自己的** window_h（本仓库是 6h），不能复用
+        # 上面的 ``prefix``——那个是 TS 的 24h 窗口，文件名会和骨架里写的对不上。
+        probability = {
+            str(name): loaded
+            for name, frame in (probability or {}).items()
+            if (loaded := load_probability(frame)) is not None
+        }
+        if probability:
+            prob_window = None
+            for frame in probability.values():
+                if "window_h" not in frame.columns:
+                    continue
+                values = pd.to_numeric(frame["window_h"], errors="coerce").dropna()
+                if len(values):
+                    prob_window = float(values.iloc[0])
+                    break
+            prob_prefix = f"{prob_window:g}h_" if prob_window else ""
+            prob_path = output_dir / f"{prob_prefix}AROC_BSS_vs_lead.png"
+            self.plot_aroc_bss_vs_lead(
+                probability, window=prob_window, save_path=prob_path
+            )
+            plt.close()
+            artifacts["AROC_BSS_vs_lead"] = prob_path
+
         if baselines:
             decay_path = output_dir / f"{prefix}multi_model_TS_delta_vs_{model_name}.png"
             self.plot_multi_model_vs_lead(
@@ -574,6 +608,10 @@ class PrecipitationPlotter:
             box_models=box_models,
             region_frames=region_frames,
             region_labels=region_labels,
+            probability=probability,
+            members=members,
+            coverage=coverage,
+            ensemble=ensemble,
         )
         artifacts["report"] = report_path
         # 别在这两行用 ✓ / ⚠：Windows 控制台默认 GBK，编码不了这两个字符。报告和图
@@ -680,5 +718,90 @@ class PrecipitationPlotter:
             )
         )
         fig.tight_layout(rect=(0, 0.05, 1, 0.97))
+        self._save(fig, save_path)
+        return fig
+
+    def plot_aroc_bss_vs_lead(
+        self,
+        model_dfs: Dict[str, pd.DataFrame],
+        *,
+        window: Optional[float] = None,
+        figsize: Tuple[int, int] = (16, 7.5),
+        save_path: Optional[Path] = None,
+        legend_title: str = "模型",
+    ):
+        """概率评分（AROC / BSS）随时效变化——上排 AROC、下排 BSS，每列一个阈值。
+
+        吃的是概率宽表（``diagnostics/probability_wide.csv``），**不是** TS 宽表：
+        列的集合完全不同，所以走 ``prepare_ts_dataframe`` 会在第一步就报缺列。
+        这里只按 ``region`` 空值筛全球行——与 ``split_regions`` 对"全球行"的定义
+        一致，免得带行混进来把曲线拉平。
+
+        两排**不共享纵轴**：AROC 以 0.5 为无技巧、BSS 以 0 为无正技巧，量纲差得
+        远（BSS 能到 −1），共享会把 BSS 的零线压到 AROC 中段去。AROC 锁 0–1
+        （它的天然上界就是 1），BSS 一律自适应——它是"相对气候基准的技巧"，
+        负多少都有可能，截断就是在藏坏消息。
+
+        Args:
+            model_dfs: ``{模型名: 概率宽表}``，主模型在前。颜色按这个次序取
+                ``MODEL_COLORS``，与箱线图、差值图是同一份配色。
+            window: 概率累积窗口（小时），只进总标题。省略则不写窗口。
+        """
+        prepared: Dict[str, pd.DataFrame] = {}
+        for name, frame in model_dfs.items():
+            subset = frame
+            if "region" in frame.columns:
+                region = frame["region"]
+                subset = frame[region.isna() | (region.astype(str).str.strip() == "")]
+            prepared[name] = subset
+
+        grades = ordered_grades(list(prepared.values()))
+        if not grades:
+            return None
+        fig, axes = plt.subplots(
+            2, len(grades), figsize=figsize, sharex=True, squeeze=False
+        )
+        palette = MODEL_COLORS
+        styles = ("-", "--", "-.", ":")
+
+        for column, grade in enumerate(grades):
+            for row, (metric, reference) in enumerate((("AROC", 0.5), ("BSS", 0.0))):
+                ax = axes[row][column]
+                ax.axhline(reference, color="k", linestyle="--", linewidth=1, alpha=0.5)
+                for model_index, (name, frame) in enumerate(prepared.items()):
+                    if metric not in frame.columns:
+                        continue
+                    subset = frame[frame["grade"].astype(str) == grade].sort_values("lead_h")
+                    values = pd.to_numeric(subset[metric], errors="coerce")
+                    if subset.empty or not values.notna().any():
+                        continue
+                    ax.plot(
+                        subset["lead_h"], values,
+                        marker="o", markersize=4, markevery=2, linewidth=1.8,
+                        linestyle=styles[model_index % len(styles)],
+                        color=palette[model_index % len(palette)], label=name,
+                    )
+                ax.set_title(f"{grade} mm")
+                ax.set_xlabel("预报时效 (小时)")
+                ax.set_ylabel(metric)
+                ax.grid(True, alpha=0.3, linestyle="--")
+                if metric == "AROC":
+                    ax.set_ylim(0, 1)
+
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        if not handles:  # 上排全空时图例得从别处捞，否则整张图没有模型名
+            for ax in axes.ravel():
+                handles, labels = ax.get_legend_handles_labels()
+                if handles:
+                    break
+        if handles:
+            fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 4),
+                       frameon=True, title=legend_title)
+        window_text = f"{window:g}h 累积窗口" if window else "概率口径"
+        fig.suptitle(
+            f"概率评分的 AROC（上排）与 BSS（下排）随时效变化（{window_text}；"
+            f"虚线为 AROC=0.5 / BSS=0 的无技巧线）"
+        )
+        fig.tight_layout(rect=(0, 0.06, 1, 0.95))
         self._save(fig, save_path)
         return fig

@@ -16,6 +16,8 @@
                     diagnostics/categorical_wide.csv。三个模式一起比：
                       --compare "FuXi=evaluation_results/weather_ts_det_fuxi/diagnostics/categorical_wide.csv" \\
                       --compare "AIFS=evaluation_results/weather_ts_det_aifs/diagnostics/categorical_wide.csv"
+    --members N     集合成员数，只在集合产物上有意义（产物里没记这个字段）。
+                    给出来后报告第一节会写明「集合每例 N 个成员」
 
 **本脚本只做入口**：把仓库根加进 ``sys.path`` → 调
 ``xmetai_evaluation.visualization.report.build_report`` → 打印产物清单。
@@ -69,6 +71,11 @@ def main(argv=None) -> int:
         "--spectrum-init", default=None,
         help="谱曲线的起报时刻，按子串匹配 init_time（如 20250102），省略取最后一个起报",
     )
+    parser.add_argument(
+        "--members", type=int, default=None,
+        help="集合成员数（只在 weather_ts_ens 上有意义）。产物里没有这个字段，"
+        "报告里凡要写成员数的地方都靠它；不给就省略数字",
+    )
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(REPO_ROOT))
@@ -82,6 +89,7 @@ def main(argv=None) -> int:
         spectrum_init=args.spectrum_init,
         change_description=args.change,
         compare=args.compare,
+        members=args.members,
     )
     print(f"\n产出 {len(artifacts)} 个文件：")
     for name, path in artifacts.items():

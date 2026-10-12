@@ -4,7 +4,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 @dataclass
@@ -23,6 +23,12 @@ class EvalConfig:
     # 时间范围
     start_date: Optional[str] = None  # YYYYMMDD or YYYYMMDDHH
     end_date: Optional[str] = None  # YYYYMMDD or YYYYMMDDHH
+    # 多时段评测：[(起始, 结束), ...]，如
+    #     periods=[("20250101", "20250215"), ("20250601", "20250715")]
+    # 与 start_date/end_date **二选一**（同时给会报配置错）。
+    # 多段共用同一个 output_dir、汇进同一套统计量（每个 变量×时效×阈值 只有
+    # 一行，不是每段各一行）；段与段之间的空档不切块、不出样本。
+    periods: Optional[List[Tuple[str, str]]] = None
     limit: Optional[int] = None  # 限制处理的初始化时间数（用于调试）
 
     # 输出

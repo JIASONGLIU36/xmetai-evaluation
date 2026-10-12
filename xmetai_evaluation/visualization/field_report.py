@@ -777,6 +777,7 @@ def manifest_info_from(manifest: Optional[Dict[str, object]]) -> Dict[str, objec
         "reference_reader": reference.get("reader") if isinstance(reference, dict) else None,
         "start_date": resolved.get("start_date") if isinstance(resolved, dict) else None,
         "end_date": resolved.get("end_date") if isinstance(resolved, dict) else None,
+        "periods": resolved.get("periods") if isinstance(resolved, dict) else None,
         "created_at": manifest.get("created_at"),
         "n_results": manifest.get("n_results"),
         "scores_rows": manifest.get("scores_rows"),
@@ -968,7 +969,15 @@ def build_field_report(
         f"（协议 `{info.get('protocol_id') or '未提供'}`）"
         + (f" —— {info['description']}" if info.get("description") else "")
     )
-    if info.get("start_date") or info.get("end_date"):
+    if info.get("periods"):
+        # 多时段逐段列出来。只打「最早 – 最晚」的话，看报告的人会以为中间那段
+        # 也评了——而空档期恰恰是没评的。
+        listed = "、".join(f"`{start}` – `{end}`" for start, end in info["periods"])
+        head.append(
+            f"- **评测时段**：{len(info['periods'])} 段 —— {listed}"
+            f"（配置口径的起止日期，不代表实际配对上的样本数；**段间空档未评**）"
+        )
+    elif info.get("start_date") or info.get("end_date"):
         head.append(
             f"- **评测时段**：`{info.get('start_date') or '?'}` – `{info.get('end_date') or '?'}`"
             f"（配置口径的起止日期，不代表实际配对上的样本数）"

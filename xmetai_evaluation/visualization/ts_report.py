@@ -12,8 +12,16 @@
 ``analysis_*`` 系列函数从已经算好的统计量里推出来，不是套话。
 
 章节：结论摘要（含评估对象与口径）→ 逐等级表现 → 随时效变化 → 误差形态与偏差结构 →
-跨时效分布（箱线图）→（可选）与对比模型的比较 →（多模型）模型能力雷达图 →
-改进建议 → 口径与注意事项。
+跨时效分布（箱线图）→（可选，集合）概率评分 AROC/BSS →（可选）与对比模型的比较 →
+（多模型）模型能力雷达图 → 改进建议 → 口径与注意事项。
+
+**概率评分那一节只在拿到概率宽表时出现**（``diagnostics/probability_wide.csv``，
+由 ``weather_ts_ens_prob`` 能力写出）。它的累积窗口与阈值都和 TS 不同，所以
+单独立节、单独编号；它一出现，后面所有章节号整体后移一位。产物里没有这张表时
+整节不出现，章节号原样——**编号跟着实际出现了什么走**，这是 ``_Numbering`` 的
+同一条规矩。集合专属的措辞（标题的「集合预报」、第一节的「集合口径」段、
+第十节的两条集合提示）则统一由 ``build_ts_report(ensemble=True)`` 打开，
+默认关：确定性与 FDP 两条流程共用本模块，不能被牵连。
 
 雷达图那一节把前面几张表的**综合评分**摆成多边形（批内 min-max，1 = 本批最好），
 只在两个及以上模型时出现——一个多边形没有比较对象。「综合」是硬要求：
@@ -40,6 +48,12 @@ import pandas as pd
 #: 两边差一个全角/半角字符测试就会红——所以只在**这里**定义一次。
 _BOX_HEADER = "| 模型 | 降水等级 | 中位数 | IQR | Q1–Q3 | 须线范围 | 离群时效 | 时效数 |"
 _BOX_SEP = "|---|---|---|---|---|---|---|---|"
+#: 概率评分宽表的必需列。缺任一列就不是这份表——**不猜、不补**（见 ``load_probability``）。
+PROBABILITY_COLUMNS = (
+    "lead_h", "grade", "threshold_mm", "AROC", "BS", "BS_ref", "BSS",
+    "base_rate", "n_points",
+)
+
 _BOX_NOTE = (
     "> 每个箱体的样本是**同模型、同量级在全部时效上的 TS 取值**"
     "（无有效 TS 的时效不计入，样本数见「时效数」列）：箱体为四分位距（IQR），中线为中位数，"
@@ -316,6 +330,34 @@ def _source_of(sources: Optional[Dict[str, str]], name: str) -> str:
     if sources and sources.get(name):
         return f"`{sources[name]}`"
     return "未提供（调用方应在 sources 里给出文件路径）"
+
+
+def _coverage_sentence(coverage: Optional[Dict[str, int]]) -> str:
+    """第一节的实测覆盖句：各份给了多少对有效样本。
+
+    这句必须存在：对比表只写分数、不写样本量，而各份来源的起报日数可以差一个
+    量级（本批是 29 天对 348 天）。不写出来，读者会把样本最少的那份的名次当成
+    结论。样本数取**最小阈值档的全时效合计**，与第二节「样本合计」列同口径。
+
+    只有一个对象（或全都是空值）时返回空串——单模型报告里这句话没有比较对象，
+    留着只是噪音。
+    """
+    entries = [(str(name), int(value)) for name, value in (coverage or {}).items() if value]
+    if len(entries) < 2:
+        return ""
+    primary, base = entries[0]
+    detail = "、".join(f"{name} {value:,}" for name, value in entries)
+    text = (
+        f"**本批实测覆盖并不齐**（最小阈值档的全时效配对样本数）：{detail}。"
+        f"站点数每天大体固定，这组数的比值基本就是各份起报日数的比值。"
+    )
+    lowest = min(entries, key=lambda item: item[1])
+    if base and lowest[0] != primary and lowest[1] / base < 0.5:
+        text += (
+            f"样本最少的是 {lowest[0]}，只有 {primary} 的 {lowest[1] / base:.1%}——"
+            f"它的分数抽样波动明显更大，名次不宜当结论用。"
+        )
+    return text
 
 
 def business_conclusion(grades: Sequence[Dict[str, object]]) -> str:
@@ -781,6 +823,120 @@ def analysis_comparison(
     return "".join(parts)
 
 
+def analysis_probability(summaries: Dict[str, Dict[str, object]]) -> str:
+    """第六节小结：区分能力、Brier 技巧的正负与走向、高阈值档的样本、AVG 的时效衰减。
+
+    与其余 ``analysis_*`` 同一条规矩：只吃 ``probability_summary`` 已经算好的数字，
+    不重新读表；每句话都要带具体数值，写不出结论时如实说。
+    """
+    if not summaries:
+        return "没有概率评分结果，本节无法给出定量分析。"
+    names = list(summaries)
+    primary = names[0]
+    rows = summaries[primary]["rows"]
+    average = summaries[primary]["average"]
+    parts: List[str] = []
+
+    usable = [entry for entry in rows if np.isfinite(entry.get("AROC", np.nan))]
+    if usable:
+        best = max(usable, key=lambda item: item["AROC"])
+        worst = min(usable, key=lambda item: item["AROC"])
+        below = [entry for entry in usable if entry["AROC"] <= 0.5]
+        head = (
+            f"{primary} 各档 AROC 在 {_fmt(worst['AROC'])}–{_fmt(best['AROC'])} 之间，"
+        )
+        if below:
+            head += (
+                "其中 " + "、".join(entry["grade"] for entry in below)
+                + " 未超过 0.5 的无技巧线，这几档的概率预报分不开事件与非事件；"
+            )
+        else:
+            head += (
+                f"全部高于 0.5 的无技巧线（最低的 {worst['grade']} 档高出 "
+                f"{_fmt(worst['AROC'] - 0.5)}）；"
+            )
+        parts.append(
+            head + f"区分能力最强的是 {best['grade']}（{_fmt(best['AROC'])}）。"
+        )
+
+    scored = [entry for entry in rows if np.isfinite(entry.get("BSS", np.nan))]
+    if scored:
+        positive = [entry for entry in scored if entry["BSS"] > 0]
+        best = max(scored, key=lambda item: item["BSS"])
+        worst = min(scored, key=lambda item: item["BSS"])
+        parts.append(
+            f"BSS 有 {len(positive)}/{len(scored)} 档为正：最好的是 {best['grade']}"
+            f"（{_fmt(best['BSS'])}），最差的是 {worst['grade']}（{_fmt(worst['BSS'])}）。"
+        )
+        if worst["BSS"] < 0:
+            parts.append(
+                f"{worst['grade']} 档为负，说明这一档的概率预报**还不如气候基准**——"
+                f"它的 BS {_fmt(worst['BS'])} 高于 BS_ref {_fmt(worst['BS_ref'])}，"
+                f"即预报概率的分布比「一律报基准率 {_fmt(worst['base_rate'])}」还差。"
+            )
+
+    if rows:
+        lightest, heaviest = rows[0], rows[-1]
+        # 各档的 ``n_points`` 是**同一个数**（阈值只改事件的定义，不改配对点），
+        # 真正随量级收缩的是**事件次数** = n_points × 基准率。写成「样本量收缩」
+        # 是错的，而且两档数字并排一样，一眼就露馅。
+        if (
+            lightest is not heaviest
+            and lightest.get("n_points")
+            and np.isfinite(lightest.get("base_rate", np.nan))
+            and np.isfinite(heaviest.get("base_rate", np.nan))
+            and heaviest["base_rate"] > 0
+        ):
+            ratio = lightest["base_rate"] / heaviest["base_rate"]
+            extra = f"（约 {ratio:.0f} 分之一）" if ratio >= 2 else ""
+            parts.append(
+                f"各档的样本点数相同（{lightest['n_points']:,} 对——阈值只改事件的定义、"
+                f"不改配对点），但**事件次数**随量级急剧收缩：{lightest['grade']} 档的"
+                f"基准率 {_fmt(lightest['base_rate'])}、{heaviest['grade']} 档只剩 "
+                f"{_fmt(heaviest['base_rate'])}{extra}"
+                f"——高阈值档的 AROC/BSS 波动更大，小数位不宜过度解读。"
+            )
+
+    by_lead = summaries[primary].get("by_lead")
+    if by_lead is not None and len(by_lead) >= 2:
+        first_lead, last_lead = float(by_lead.index[0]), float(by_lead.index[-1])
+        aroc_first, aroc_last = float(by_lead["AROC"].iloc[0]), float(by_lead["AROC"].iloc[-1])
+        bss_first, bss_last = float(by_lead["BSS"].iloc[0]), float(by_lead["BSS"].iloc[-1])
+        parts.append(
+            f"AVG 档随时效：AROC 从 {first_lead:g}h 的 {_fmt(aroc_first)} 变到 "
+            f"{last_lead:g}h 的 {_fmt(aroc_last)}（{aroc_last - aroc_first:+.3f}），"
+            f"BSS 从 {_fmt(bss_first)} 变到 {_fmt(bss_last)}（{bss_last - bss_first:+.3f}）——"
+            + (
+                "区分能力随时效退化，长时效的结论同样要限定范围。"
+                if aroc_last < aroc_first
+                else "区分能力并不随时效单调下降，这时段内的分档主要由样本波动支配。"
+            )
+        )
+
+    if len(names) > 1:
+        pool = {
+            name: summary["average"]
+            for name, summary in summaries.items()
+            if np.isfinite(summary["average"].get("AROC", np.nan))
+            and np.isfinite(summary["average"].get("BSS", np.nan))
+        }
+        if len(pool) >= 2:
+            best_aroc = max(pool, key=lambda name: pool[name]["AROC"])
+            best_bss = max(pool, key=lambda name: pool[name]["BSS"])
+            parts.append(
+                f"AVG 档上 AROC 最高的是 {best_aroc}（{_fmt(pool[best_aroc]['AROC'])}）、"
+                f"BSS 最高的是 {best_bss}（{_fmt(pool[best_bss]['BSS'])}）。"
+                f"各模型的概率样本量并不相同（见「样本点数」列），样本少的那个名次波动更大。"
+            )
+
+    if np.isfinite(average.get("AROC", np.nan)):
+        parts.append(
+            f"{primary} 的 AVG 档：AROC {_fmt(average['AROC'])}、BSS {_fmt(average['BSS'])}"
+            f"（对 {average['n_grades']} 个可算阈值等权平均）。"
+        )
+    return "".join(parts) or "概率评分的各档取值都不可用，本节无法给出定量分析。"
+
+
 def _lead_table(pivot: pd.DataFrame) -> str:
     columns = [str(column) for column in pivot.columns]
     lines = ["| 时效(h) | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
@@ -939,8 +1095,10 @@ def _box_table(models: Dict[str, pd.DataFrame], metric: str = "TS") -> str:
         for name in names:
             row = stats[name].get(grade)
             if row is None or row["n"] == 0:
-                # 该模型没有这个量级（或全无有效值）：照出一行全 —，和图上那个空槽位对齐
-                cells = ["—"] * 6 + ["0"]
+                # 该模型没有这个量级（或全无有效值）：照出一行全 —，和图上那个空槽位对齐。
+                # 五格 —— 对应中位数/IQR/Q1–Q3/须线/离群时效，末格才是时效数 0；
+                # 写成 6 格会多出一列，Markdown 表格跟着错位。
+                cells = ["—"] * 5 + ["0"]
             else:
                 leads = "、".join(f"{lead:g}h" for lead in sorted(row["outlier_leads"])) or "—"
                 cells = [
@@ -984,6 +1142,218 @@ def _multi_baseline_table(
             f"| {grade} | {_fmt(left[grade])} | {cells} | {rank}/{len(ranked) if ranked else 0} |"
         )
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------- 概率评分（第六节）
+#
+# 这一节吃的是**另一张表**：``diagnostics/probability_wide.csv``，由
+# ``weather_ts_ens_prob`` 能力写出（6h 累积窗、逐成员概率、需要外部气候概率参考）。
+# 它的窗口与阈值都和 TS 那套不同，所以单独立节、单独编号——见骨架
+# ``assets/templates/weather_ts_ens.md`` 第六节。
+
+
+def _members_phrase(members: Optional[int]) -> str:
+    """``51个成员`` / ``集合成员``。
+
+    产物里**没有**成员数（``manifest.json`` 不写这个字段），所以拿不到时老老实实
+    写「集合成员」，不编一个数字出来。拿到时由调用方的 ``--members`` 给。
+    """
+    return f"{int(members)}个成员" if members else "集合成员"
+
+
+def load_probability(frame: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """校验概率宽表。
+
+    ``None`` 原样返回 ``None``——这份产物没跑概率评分那一段（比如对比模型给的是
+    确定性的裸宽表），第六节整节不出现。给了表但缺列则**报错**：少一列的表算出来的
+    AROC/BSS 与评测流程自己写的不是一回事，宁可停下。
+
+    Raises:
+        ValueError: 表里缺 :data:`PROBABILITY_COLUMNS` 里的列。
+    """
+    if frame is None:
+        return None
+    missing = [column for column in PROBABILITY_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"概率宽表缺列 {missing}；现有列 {list(frame.columns)}。"
+            f"这份表由 weather_ts_ens_prob 能力写出，配置里写 "
+            f'pipeline=["weather_ts_ens", "weather_ts_ens_prob"] 才会落到 '
+            f"diagnostics/probability_wide.csv。"
+        )
+    return frame
+
+
+def probability_summary(frame: pd.DataFrame) -> Dict[str, object]:
+    """单模型的概率评分汇总：逐档一行 + 一行 ``AVG`` + ``by_lead``。
+
+    每一档的取值是**各时效等权平均**——AROC / BSS 没有可加的充分统计量，不像 TS
+    那样能「先合计列联表再算比率」，逐时效平均是这里唯一站得住的做法。
+    ``AVG`` 行再对**可算阈值**等权平均（某档全无有效值时跳过，不拿 0 顶替）。
+    ``n_points`` 是该档**全时效合计**的配对数，与第二节的「样本合计」同口径；
+    ``AVG`` 行的这一格写的是**参与平均的档数**（老表里叫 ``n_used``），
+    不是样本数——它本来就没有单一阈值可数。
+
+    产物自己带的 ``grade="AVG"`` 行**丢掉不要**：那份是产物按它自己的口径折的，
+    与本报告「可算阈值等权平均」未必是同一个数，两行并排会自相矛盾。
+    """
+    if "grade" in frame.columns:
+        frame = frame[frame["grade"].astype(str) != "AVG"]
+
+    rows: List[Dict[str, object]] = []
+    for grade, subset in frame.groupby("grade", observed=True):
+        thresholds = pd.to_numeric(subset["threshold_mm"], errors="coerce").dropna()
+        entry: Dict[str, object] = {
+            "grade": str(grade),
+            "threshold": float(thresholds.iloc[0]) if len(thresholds) else None,
+            "n_leads": int(pd.to_numeric(subset["lead_h"], errors="coerce").nunique()),
+        }
+        for key in ("AROC", "BS", "BS_ref", "BSS", "base_rate"):
+            values = pd.to_numeric(subset[key], errors="coerce").dropna()
+            entry[key] = float(values.mean()) if len(values) else float("nan")
+        points = pd.to_numeric(subset["n_points"], errors="coerce").dropna()
+        entry["n_points"] = int(points.sum()) if len(points) else 0
+        rows.append(entry)
+    rows.sort(key=lambda item: _grade_sort_key(item["grade"], item["threshold"]))
+
+    average: Dict[str, object] = {
+        "grade": "AVG", "threshold": None, "base_rate": None, "n_points": None,
+    }
+    for key in ("AROC", "BS", "BS_ref", "BSS"):
+        values = [float(item[key]) for item in rows if np.isfinite(item[key])]
+        average[key] = float(np.mean(values)) if values else float("nan")
+    average["n_grades"] = len(
+        [item for item in rows if np.isfinite(item["AROC"]) and np.isfinite(item["BSS"])]
+    )
+    average["n_leads"] = max((item["n_leads"] for item in rows), default=0)
+
+    numeric = frame.assign(
+        lead_h=pd.to_numeric(frame["lead_h"], errors="coerce"),
+        AROC=pd.to_numeric(frame["AROC"], errors="coerce"),
+        BSS=pd.to_numeric(frame["BSS"], errors="coerce"),
+    )
+    by_lead = numeric.groupby("lead_h")[["AROC", "BSS"]].mean().dropna(how="all")
+    return {"rows": rows, "average": average, "by_lead": by_lead}
+
+
+def _probability_window(frame: pd.DataFrame) -> Optional[float]:
+    """概率宽表的累积窗口（``window_h`` 列）——表题与引用块都要写它。"""
+    if "window_h" not in frame.columns:
+        return None
+    values = pd.to_numeric(frame["window_h"], errors="coerce").dropna()
+    return float(values.iloc[0]) if len(values) else None
+
+
+def _threshold_list(frame: pd.DataFrame) -> str:
+    """``0.1/4/13/25mm``——引用块里要和 TS 的阈值列表并排写，得各自现取。"""
+    values = sorted(
+        {float(value) for value in pd.to_numeric(frame["threshold_mm"], errors="coerce").dropna()}
+    )
+    return "/".join(f"{value:g}" for value in values) + "mm" if values else "—"
+
+
+def _probability_note(window: Optional[float]) -> str:
+    """概率评分表下的口径引用块——与骨架第六节逐字一致。
+
+    只有累积窗口那一处是变量：骨架写死的 ``6h`` 就是本仓库当前的概率窗口常量，
+    换个窗口这句话会变成假话，所以从表里现取。
+    """
+    span = f"{window:g}h" if window else "概率"
+    return (
+        f"> BS_ref 是气候基准的 Brier 分数，**只有外部给了气候概率参考的 {span} 窗才有值**，"
+        f"其余窗口整列写 —；BSS = 1 − BS/BS_ref。AROC 在**逐成员插值后**按超越式阈值"
+        f'（x ≥ 阈值）计算，与前面章节"插值到站再配对"的做法不是一回事。'
+        f"AVG 行是对**可算阈值**的等权平均（该档无事件的跳过），不是按样本数加权。"
+    )
+
+
+def _probability_table(
+    summaries: Dict[str, Dict[str, object]], *, with_model: bool
+) -> str:
+    """概率评分表：一行一个「模型 × 降水等级」，每个模型末尾再加一行 ``AVG``。
+
+    ``with_model`` 由调用方按模型数决定——骨架单模型分支的表头里没有「模型」列，
+    多模型分支才需要它来分清是谁的行。
+    """
+    header = (["模型"] if with_model else []) + [
+        "降水等级", "阈值(mm)", "AROC", "BS", "BS_ref", "BSS", "基准率", "样本点数",
+    ]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for name, summary in summaries.items():
+        for entry in list(summary["rows"]) + [summary["average"]]:
+            # AVG 行没有单一阈值/基准率/样本数，那三格写 —；末格改成**参与平均的档数**
+            # （老表里那一列的 ``n_used`` 就是这个意思），比一个空的「—」有信息量。
+            cells = [
+                _fmt(entry.get("threshold"), 3),
+                _fmt(entry.get("AROC")),
+                _fmt(entry.get("BS")),
+                _fmt(entry.get("BS_ref")),
+                _fmt(entry.get("BSS")),
+                _fmt(entry.get("base_rate")),
+                (
+                    f"{entry['n_points']:,}" if entry.get("n_points")
+                    else (f"{entry['n_grades']} 档" if entry.get("n_grades") else "—")
+                ),
+            ]
+            prefix = [str(name)] if with_model else []
+            lines.append("| " + " | ".join(prefix + [str(entry["grade"])] + cells) + " |")
+    return "\n".join(lines)
+
+
+def _section_probability(
+    probability: Dict[str, pd.DataFrame],
+    artifacts: Optional[Dict[str, Path]],
+    numbering: _Numbering,
+    *,
+    number: str = "六",
+    members: Optional[int] = None,
+    ts_window: Optional[float] = None,
+    ts_thresholds: str = "—",
+) -> List[str]:
+    """「概率评分（AROC / BSS）」一节——只在拿到概率宽表时出现。
+
+    引导语、引用块、表头都照骨架写；只有那一堆数字和窗口/阈值是从表里现取的。
+    ``number`` 是章号（默认「六」）：这一节之后所有节号都要顺延，所以由调用方给。
+    """
+    summaries = {name: probability_summary(frame) for name, frame in probability.items()}
+    primary = next(iter(probability))
+    window = _probability_window(probability[primary])
+    window_text = f"{window:g}h" if window else "概率"
+
+    leads = sorted(
+        float(value) for value in pd.to_numeric(probability[primary]["lead_h"], errors="coerce").dropna()
+    )
+    span = f"{leads[0]:g}–{leads[-1]:g}h" if leads else "各时效"
+
+    lines = [f"## {number}、概率评分（AROC / BSS，{window_text} 累积窗口）", ""]
+    lines += [
+        f"前面五节评的都是{_members_phrase(members)}的**平均场**，成员之间的离散信息"
+        f"一点没进指标——一个成员高度一致、另一个成员四散分布的集合，前五节的分数"
+        f"可以完全相同。本节改用全体成员的概率分布：AROC 衡量预报概率把事件与非事件"
+        f"分开的能力（0.5 为无技巧），BSS 衡量相对气候基准的 Brier 技巧（>0 才算有正技巧）。",
+        "",
+        f"**本节与前面五节不同口径**：概率评分用 {window_text} 累积窗口、"
+        f"阈值 {_threshold_list(probability[primary])}，与前面 "
+        + (f"{ts_window:g}h / " if ts_window else "")
+        + f"{ts_thresholds} 既不可比，也不要画进同一张图。",
+        "",
+    ]
+    lines += _table_caption(
+        numbering, "各降水等级的概率评分（各时效等权平均；AVG 为可算阈值的等权平均）"
+    )
+    lines.append(_probability_table(summaries, with_model=len(summaries) > 1))
+    lines.append("")
+    lines.append(_probability_note(window))
+    lines.append("")
+    caption = (
+        f"{span} 概率评分的 AROC（上排，虚线为 0.5 的无技巧线）与 BSS（下排，虚线为 0 的"
+        f"无正技巧线）随时效变化，每列一个阈值；AROC 越靠上区分能力越强，"
+        f"BSS 越靠上越优于气候基准"
+    )
+    lines += _figure_block(artifacts, numbering, "AROC_BSS_vs_lead", caption)
+    lines.append(f"**小结**：{analysis_probability(summaries)}")
+    lines.append("")
+    return lines
 
 
 def _figure_captions(
@@ -1549,6 +1919,10 @@ def build_ts_report(
     box_models: Optional[Dict[str, pd.DataFrame]] = None,
     region_frames: Optional[Dict[str, pd.DataFrame]] = None,
     region_labels: Optional[Dict[str, str]] = None,
+    probability: Optional[Dict[str, pd.DataFrame]] = None,
+    members: Optional[int] = None,
+    coverage: Optional[Dict[str, int]] = None,
+    ensemble: bool = False,
 ) -> Path:
     """写一份 Markdown 报告。
 
@@ -1567,6 +1941,18 @@ def build_ts_report(
             得到空集，所以它显式传这个参数。
         region_labels: ``{带名: 边界串}``，只影响带名怎么写（``south [0, 15]``），
             取不到就只显示带名。
+        probability: ``{模型名: 概率宽表}``（``diagnostics/probability_wide.csv``，
+            含主模型）。给了就多出「概率评分（AROC / BSS）」一节，**后面所有章节号
+            顺延一位**；不给（确定性产物、或集合没跑 ``weather_ts_ens_prob`` 那一段）
+            整节不出现，章节号原样。
+        members: 主模型的集合成员数（``--members``）。产物里没有这个字段，
+            拿不到时相关句子里不写数字。只有 ``ensemble=True`` 时用得上。
+        coverage: ``{模型名: 有效配对数}``，进第一节的实测覆盖句。本报告的对比表
+            只写分数、不写样本量，而各份来源的起报日数可以差一个量级——不写出来，
+            读者会把样本最少的那份的名次当成结论。
+        ensemble: 是不是集合产物。打开才出集合专属措辞（标题的「集合预报」、
+            第一节的「集合口径」段、第十节的两条集合提示）。**默认关**：确定性与
+            FDP 两条流程共用本模块，骨架与逐字测试都对着它们，不能被牵连。
     """
     output_path = Path(output_path)
     # 全球行与带行分开算：``data`` 里混着带行时，第二～五节会把同一天算好几遍。
@@ -1599,6 +1985,18 @@ def build_ts_report(
     comparisons: Dict[str, pd.DataFrame] = dict(baselines or {})
     if baseline_df is not None:
         comparisons.setdefault(baseline_name or "基准", baseline_df)
+
+    # 概率宽表统一在这里过一遍校验：空表 / 缺列在这里就报出清晰的错，而不是等到
+    # 第六节算到一半才发现是张别的表。``None`` 与空 dict 等价——都表示这份产物
+    # 没有概率评分那一段（确定性产物、或集合没跑 weather_ts_ens_prob）。
+    # 注意别把结果写回 ``probability`` 自己：``probability = {}`` 先执行、
+    # 循环头里的 ``(probability or {})`` 后求值，等于遍历空 dict，整节会静默消失。
+    loaded_tables: Dict[str, pd.DataFrame] = {}
+    for name, frame in (probability or {}).items():
+        loaded = load_probability(frame)
+        if loaded is not None:
+            loaded_tables[str(name)] = loaded
+    probability = loaded_tables
 
     # 雷达图：模型集合与第五节箱线图**用的是同一个 dict**（`models`），免得
     # "图里少一个模型"这种错从后门溜回来。单模型不画——一个多边形没有比较对象。
@@ -1644,7 +2042,13 @@ def build_ts_report(
     captions = _figure_captions(summary, window=window, lead=lead, model_name=model_name)
 
     lines: List[str] = []
-    lines.append(f"# {model_name}降水评估报告")
+    # 集合产物的标题按骨架写成「集合预报N模型降水评估报告」；确定性那份保持
+    # 「{模型名}降水评估报告」不变——它有自己的骨架与逐字测试。
+    title = (
+        f"集合预报{_model_count_word(len(models))}模型降水评估报告"
+        if ensemble else f"{model_name}降水评估报告"
+    )
+    lines.append(f"# {title}")
     lines.append("")
 
     # 评估对象/口径与结论合成同一节：先交代「评的是谁、多少天、什么指标」，
@@ -1653,7 +2057,8 @@ def build_ts_report(
         contrast = (
             "对比对象为"
             + "、".join(f"{name}（来源：{_source_of(sources, name)}）" for name in comparisons)
-            + "——两者应使用同一时段、同一站点集、同一窗口与阈值口径，"
+            + ("——各者应使用同一时段" if len(comparisons) > 1 else "——两者应使用同一时段")
+            + "、同一站点集、同一窗口与阈值口径，"
             "若来源文件的口径不同，结论不可直接横向比较。"
         )
     else:
@@ -1663,7 +2068,9 @@ def build_ts_report(
     lines.append("")
     lines.append(
         f"本报告评估{model_name}（来源：{_source_of(sources, model_name)}），"
+        + (f"集合每例{int(members)}个成员，" if (ensemble and members) else "")
         + contrast
+        + _coverage_sentence(coverage)
         + "评估口径为站点分类检验（"
         + (f"{window:g}h 累积窗口，" if window else "")
         + f"时效 {leads[0]:g}–{leads[-1]:g}h 共 {len(leads)} 个，{summary['n_rows']} 条记录），"
@@ -1677,6 +2084,19 @@ def build_ts_report(
     lines.append("")
     lines.append(f"**业务定性**：{business_conclusion(grades)}")
     lines.append("")
+    if ensemble:
+        # 集合产物必须点明：这五个指标算在**平均场**上，成员离散信息一点没进去。
+        # 不写这一句，读者会把「集合」当成「集合技巧比确定性好」，而这里根本没比。
+        lines.append(
+            f"集合口径：TS / POD / FAR / 漏报率 / BIAS 均在{_members_phrase(members)}的"
+            f"**平均场**上计算（确定性口径），不是逐成员评分后再平均；"
+            + (
+                "成员离散信息只在第六节的概率评分里体现。"
+                if probability
+                else "本批没有概率评分表，成员离散信息在这份报告里没有体现。"
+            )
+        )
+        lines.append("")
     lines.append(
         "指标定义：TS = hits/(hits+misses+false_alarms)，POD = hits/(hits+misses)，"
         "FAR = false_alarms/(hits+false_alarms)，漏报率 = 1−POD，"
@@ -1689,45 +2109,87 @@ def build_ts_report(
     lines += _section_error_shape(summary, artifacts, numbering, captions)
     lines += _section_boxplot(models, artifacts, numbering, captions, model_name)
 
+    # 章节号跟着**实际出现了哪几节**走：概率评分与雷达图都是可选的，每出现一节，
+    # 后面所有节号顺延一位。写死数字会在缺节时留下断号。
+    next_number = 6
+    if probability:
+        lines += _section_probability(
+            probability, artifacts, numbering,
+            number=_CN_NUM[next_number],
+            members=members,
+            ts_window=window,
+            ts_thresholds=_threshold_list(data),
+        )
+        next_number += 1
+
     if comparisons:
         if baselines:
-            heading = f"## 六、与对比模型的比较（{lead:g}h，TS）"
+            heading = f"## {_CN_NUM[next_number]}、与对比模型的比较（{lead:g}h，TS）"
             caption = f"{lead:g}h 时效上各模型的 TS 与本模型名次"
             note: Optional[str] = (
                 "> 名次按该时效的 TS 排序（仅统计有有效值的模型）；"
                 "不同数据的起报时段/时效范围要一致才可直接比较。"
             )
         else:
-            heading = f"## 六、与基准 {baseline_name or '基准'} 的对比（{lead:g}h）"
+            heading = (
+                f"## {_CN_NUM[next_number]}、与基准 {baseline_name or '基准'} 的对比（{lead:g}h）"
+            )
             caption = f"{lead:g}h 时效上本模型与基准的 TS 及差值"
             note = None
         lines += _section_comparison(
             data, comparisons, artifacts, numbering, captions,
             lead=lead, heading=heading, caption=caption, note=note,
         )
+        next_number += 1
 
-    # 章节号顺延：对比节占「六」，雷达图占「七」，改进建议与口径各再往后挪一位。
-    # 雷达图只在多模型（也就是必有对比对象）时出现，所以落点只有三种组合。
-    numerals = "六七八九"
-    step = (1 if comparisons else 0) + (1 if radar else 0)
+    # 雷达图只在多模型（也就是必有对比对象）时出现——一个多边形没有比较对象
     if radar:
         lines += _section_capability(
             models, numbering,
-            heading=f"## {numerals[step - 1]}、模型能力雷达图",
+            heading=f"## {_CN_NUM[next_number]}、模型能力雷达图",
             radar_path=radar_path,
         )
+        next_number += 1
 
-    lines.append(f"## {numerals[step]}、改进建议")
+    lines.append(f"## {_CN_NUM[next_number]}、改进建议")
     lines.append("")
     for index, item in enumerate(recommendations(grades), start=1):
         lines.append(f"{index}. {item}")
     lines.append("")
-    lines.append(f"## {numerals[step + 1]}、口径与注意事项")
+    next_number += 1
+    lines.append(f"## {_CN_NUM[next_number]}、口径与注意事项")
     lines.append("")
     lines.append("- **值缺失的含义**：TS 为 “—” 表示该等级没有有效配对或无事件，与“评分为 0”不同；")
     lines.append("- **BIAS 不是平均误差**：它是频率偏差，>1 表示预报事件偏多，<1 表示偏少；")
+    if ensemble:
+        # 没跑概率评分时不能写「要看第六节」——那一节根本没出现，会指到空处。
+        lines.append(
+            "- **前五节评的是集合平均场**：TS / POD / FAR / 漏报率 / BIAS 都不含成员离散信息，"
+            + ("集合的相对优势要看第六节；" if probability else "本批未跑概率评分；")
+        )
+        if probability:
+            lines.append(
+                "- **概率评分与 TS 不可混比**：两者的累积窗口与阈值都不同，"
+                "AROC 还是逐成员概率口径；"
+            )
+    if coverage and len(coverage) > 1:
+        lines.append(
+            "- **各模型的样本量并不相同**：第一节列的是各份实测配对数，"
+            "差值来自起报日数而非口径；样本最少的那份名次波动最大，横向比高低前先看那一行；"
+        )
     lines.append("- **跨时效不要直接平均后比较模型**：正式对比应使用共同有效样本与固定验证口径；")
-    lines.append("- 结果来自统一长表（`scores.csv` / `categorical_wide.csv`），逐行可追溯到具体时效与阈值。")
+    lines.append(
+        "- 结果来自统一长表（`scores.csv` / `categorical_wide.csv`"
+        # 概率表的文件名新老不一：v2 产物是 diagnostics/probability_wide.csv，
+        # 老归档把两张裸 CSV 并排放，叫 aroc_bss*.csv。两个名字都写出来，
+        # 免得读者拿着新名字在老归档目录里找不到第六节的数据来源。
+        + (
+            "，概率评分另见同目录的 `probability_wide.csv`（老归档叫 `aroc_bss*.csv`）"
+            if probability
+            else ""
+        )
+        + "），逐行可追溯到具体时效与阈值。"
+    )
     lines.append("")
 
     # 附 L 放在「口径与注意事项」之后：它是可选块，编号走自己的 `图 L*` 命名空间，

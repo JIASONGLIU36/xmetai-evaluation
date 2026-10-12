@@ -34,7 +34,7 @@ from xmetai_evaluation.pipeline.protocols import (
     select_observation_files,
     typhoon_storm_filter,
 )
-from xmetai_evaluation.pipeline.spec import PipelineSpec, daily_times
+from xmetai_evaluation.pipeline.spec import PipelineSpec
 
 log = logging.getLogger(__name__)
 
@@ -120,8 +120,12 @@ def build_plan(
             _layout_step_hours(forecast),
         )
         if not init_times:
+            # 走 period() 而不是直接读 start_date/end_date：多时段配置下那两个是
+            # None，直接插进消息里会打出「None–None」。包络区间在这里正好合适
+            # （"整个评测时段里没有一条分析场"）。
+            period_start, period_end = spec.period()
             raise EvaluationError(
-                f"评测时段 {spec.start_date}–{spec.end_date} 内没有任何起报时刻"
+                f"评测时段 {period_start:%Y%m%d}–{period_end:%Y%m%d} 内没有任何起报时刻"
                 f"对得上 BABJ 报文的分析场（报文里没有在评台风的分析记录？）"
             )
     if spec.limit:
@@ -238,12 +242,11 @@ def _discover_init_times(spec: PipelineSpec, forecast: Any) -> List[datetime]:
     ]
     if explicit:
         return sorted(explicit)
-    start, end = spec.period()
     discovered = forecast.catalog.discover(
         DataRequest(
             source_id=forecast.source_id,
             variables=_forecast_variables(spec),
-            init_times=daily_times(start, end),
+            init_times=spec.init_candidate_times(),
         )
     )
     return list(forecast.reader.available_init_times(discovered))
