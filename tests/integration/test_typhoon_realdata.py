@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """真实数据档：BABJ 报文 / 确定性预报 / 集合预报 × 标准归档对拍。
 
-路径全部经环境变量提供，未配置或路径不存在时自动 skip：
+路径优先取环境变量，未设置时回落到默认目录（见下方 ``_data_dir`` 调用里的
+默认值）；最终路径不存在时自动 skip：
 
 - ``XMETAI_BABJ_DIR``       BABJ 报文目录
 - ``XMETAI_FUXI_DET_ROOT``  确定性 FuXi 预报根（``root/YYYYMMDD/001.nc…``）
@@ -22,15 +23,28 @@ import pandas as pd
 import pytest
 
 from tests import runner
+from xmetai_evaluation.metrics.track_error import (
+    CURVE_FIELDS,
+    ENS_EXTRA_FIELDS,
+    ENS_SUMMARY_FIELDS,
+    SUMMARY_FIELDS,
+)
 
 pytestmark = pytest.mark.realdata
 pytest.importorskip("netCDF4")
 
-BABJ_DIR = os.environ.get("XMETAI_BABJ_DIR")
-FUXI_DET_ROOT = os.environ.get("XMETAI_FUXI_DET_ROOT")
-FUXI_ENS_ROOT = os.environ.get("XMETAI_FUXI_ENS_ROOT")
-TC_DET_ARCHIVE = os.environ.get("XMETAI_TC_DET_ARCHIVE")
-TC_ENS_ARCHIVE = os.environ.get("XMETAI_TC_ENS_ARCHIVE")
+def _data_dir(env_name: str, default: str) -> Path:
+    """环境变量优先；未设置（或为空）时用本机默认目录。"""
+    return Path(os.environ.get(env_name) or default)
+
+
+#: 默认数据目录——不用 export 也能直接跑；换机器时用 XMETAI_* 环境变量
+#: 覆盖（优先于这里），或直接改默认值。
+BABJ_DIR = _data_dir("XMETAI_BABJ_DIR", "/workspace/data/shenzw/typhoon_test_data/babj")
+FUXI_DET_ROOT = _data_dir("XMETAI_FUXI_DET_ROOT", "/workspace/data/shenzw/typhoon_test_data/det")
+FUXI_ENS_ROOT = _data_dir("XMETAI_FUXI_ENS_ROOT", "/workspace/data/shenzw/typhoon_test_data/ens")
+TC_DET_ARCHIVE = _data_dir("XMETAI_TC_DET_ARCHIVE", "/workspace/data/shenzw/typhoon_test_data/det_archive")
+TC_ENS_ARCHIVE = _data_dir("XMETAI_TC_ENS_ARCHIVE", "/workspace/data/shenzw/typhoon_test_data/ens_archive")
 
 ENS_INIT_ISO = "2025-06-10T00:00:00"
 DET_INIT_ISO = "2025-07-03T00:00:00"
@@ -43,6 +57,56 @@ def _require(value, name):
     if not path.exists():
         pytest.skip(f"{name}={value} 不存在")
     return path
+
+
+def _assert_case_outputs(output_dir, case, meta, tcid, init_iso, *, ensemble=False):
+    combined = pd.read_csv(runner.case_dir(output_dir) / "typhoon.csv", dtype={"tcid": str})
+    assert list(combined.columns) == ["tcid", "tcname", "init_utc", *case.columns]
+    assert len(combined) == len(case)
+    assert combined["tcid"].tolist() == [tcid] * len(case)
+    assert combined["tcname"].tolist() == [meta["tcname"]] * len(case)
+    assert combined["init_utc"].tolist() == [init_iso.replace("T", " ")] * len(case)
+    assert combined["valid_bjt"].tolist() == case["valid_bjt"].tolist()
+    for column in case.columns:
+        if column != "valid_bjt":
+            assert np.allclose(
+                combined[column], case[column], rtol=5e-6, atol=1e-8, equal_nan=True
+            ), column
+
+    init_time = datetime.fromisoformat(init_iso)
+    expected_valid = [
+        str(init_time + pd.Timedelta(hours=float(lead) + 8)) for lead in case["lead_h"]
+    ]
+    assert case["valid_bjt"].tolist() == expected_valid
+    assert meta["tcid"] == tcid
+    assert meta["init_utc"] == init_iso.replace("T", " ")
+    assert meta["init_bjt"] == str(init_time + pd.Timedelta(hours=8))
+    assert meta["forecast_type"] == ("ens" if ensemble else "det")
+    assert meta["n_leads"] == len(case)
+    assert meta["n_matched"] == int(case["track_err_km"].notna().sum())
+    assert meta["lead_step"] == 6
+    assert meta["tz_shift_h"] == 8
+    assert meta["has_wind"] == bool(case["fcst_vmax_ms"].notna().any())
+
+    missing_obs = case["obs_lat"].isna()
+    fields = ENS_SUMMARY_FIELDS if ensemble else SUMMARY_FIELDS
+    assert case.loc[missing_obs, list(fields)].isna().all().all()
+    scores = runner.read_scores(output_dir)
+    metric = "track_error_ens" if ensemble else "track_error"
+    assert len(scores) == len(fields)
+    assert set(scores["metric"]) == {f"{metric}.{field}" for field in fields}
+    assert scores["storm"].astype(str).tolist() == [tcid] * len(fields)
+    assert scores["init_time"].tolist() == [init_iso] * len(fields)
+    assert set(scores["status"]) == {"success"}
+    assert set(scores["product_kind"]) == {"ensemble" if ensemble else "deterministic"}
+    assert scores["n_valid"].tolist() == [meta["n_matched"]] * len(fields)
+    assert scores["n_requested"].tolist() == [len(case)] * len(fields)
+    values = scores.set_index("metric")["value"]
+    for field in fields:
+        assert np.allclose(
+            values[f"{metric}.{field}"], combined[field].mean(),
+            rtol=1e-12, atol=1e-10, equal_nan=True,
+        ), field
 
 
 def test_real_babj_seed_regression():
@@ -93,8 +157,10 @@ def test_real_det_parity_20250703(tmp_path):
     )
     ours = runner.read_case(out, "2503", DET_INIT_ISO)
     reference = pd.read_csv(archive / "tc2503_2025070300.csv")
+    assert list(ours.columns) == list(CURVE_FIELDS)
     assert list(ours.columns) == list(reference.columns)
     assert len(ours) == len(reference) == 60
+    assert ours["lead_h"].tolist() == list(range(6, 361, 6))
     assert (ours["valid_bjt"] == reference["valid_bjt"]).all()
     for column in reference.columns:
         if column == "valid_bjt":
@@ -107,10 +173,13 @@ def test_real_det_parity_20250703(tmp_path):
     assert meta["init_pos"] == pytest.approx(archive_meta["init_pos"])  # 种子位置
     assert meta["n_matched"] == archive_meta["n_matched"] == 18
     assert meta["seed"] == "init+6h"
+    assert meta["has_wind"] is True
+    assert math.isnan(ours.loc[0, "at_km"]) and math.isnan(ours.loc[0, "ct_km"])
+    _assert_case_outputs(out, ours, meta, "2503", DET_INIT_ISO)
 
 
 def test_real_ens_parity_20250610(tmp_path):
-    """真跑 2501@0610（集合），用归档逐成员表重算 3 成员口径的期望值对拍。"""
+    """真跑 2501@0610（集合），按当前可用成员重算归档 A/B 口径并对拍。"""
     babj_dir = _require(BABJ_DIR, "XMETAI_BABJ_DIR")
     ens_root = _require(FUXI_ENS_ROOT, "XMETAI_FUXI_ENS_ROOT")
     archive = _require(TC_ENS_ARCHIVE, "XMETAI_TC_ENS_ARCHIVE")
@@ -128,20 +197,46 @@ def test_real_ens_parity_20250610(tmp_path):
         end="20250610",
         options={"storm_ids": ["2501"]},
     )
-    ours = runner.read_case(out, "2501", ENS_INIT_ISO).set_index("lead_h")
+    case = runner.read_case(out, "2501", ENS_INIT_ISO)
+    assert list(case.columns) == list(CURVE_FIELDS + ENS_EXTRA_FIELDS)
+    assert case["lead_h"].tolist() == list(range(6, 361, 6))
+    ours = case.set_index("lead_h")
     meta = runner.read_meta(out, "2501", ENS_INIT_ISO)
     assert meta["n_members"] == len(member_names)
+    assert set(meta["members"]) == {str(int(name.split("_")[1])) for name in member_names}
+    assert meta["forecast_type"] == "ens"
+    assert meta["n_leads"] == 60
     assert meta["seed"] == "init+6h"
 
     reference = pd.read_csv(archive / "tc2501_2025061000_members.csv")
     reference = reference[reference["member"].isin(member_names)].copy()
+    assert set(reference["member"]) == set(member_names)
     reference["lead_h"] = reference["lead_h"].astype(float)
+    assert not reference.duplicated(["lead_h", "member"]).any()
     grouped = reference.groupby("lead_h", sort=True)
     leads = [float(value) for value in sorted(reference["lead_h"].unique())]
+    assert leads == ours.index.tolist()
+    assert grouped.size().tolist() == [len(member_names)] * len(leads)
     obs_lat = grouped["obs_lat"].first().reindex(leads)
     obs_lon = grouped["obs_lon"].first().reindex(leads)
     mean_lat = grouped["fcst_lat"].mean().reindex(leads)
     mean_lon = grouped["fcst_lon"].mean().reindex(leads)
+
+    for column in ("fcst_lat", "fcst_lon", "fcst_pmin_hpa", "fcst_vmax_ms"):
+        expected = grouped[column].mean().reindex(leads)
+        assert np.allclose(
+            ours.loc[leads, column], expected, rtol=1e-6, atol=0.01, equal_nan=True
+        ), column
+    for column in ("obs_lat", "obs_lon", "obs_pmin_hpa", "obs_vmax_ms"):
+        expected = grouped[column].first().reindex(leads)
+        assert np.allclose(
+            ours.loc[leads, column], expected, rtol=0, atol=1e-9, equal_nan=True
+        ), column
+    for column in ("wind_err_ms", "pmin_err_hpa"):
+        expected = grouped[column].mean().reindex(leads)
+        assert np.allclose(
+            ours.loc[leads, column], expected, rtol=1e-6, atol=0.01, equal_nan=True
+        ), column
 
     # 成员独立列逐位一致；A 类 = 归档逐成员误差的均值
     assert (ours.loc[leads, "valid_bjt"] == grouped["valid_bjt"].first().reindex(leads)).all()
@@ -206,9 +301,12 @@ def test_real_ens_parity_20250610(tmp_path):
         expected_valid.to_numpy()[obs_ok],
     )
     assert meta["n_matched"] == int(obs_ok.sum())
+    assert case["n_members"].tolist() == [len(member_names)] * len(case)
+    assert set(meta["aggregation"]) == {"A", "B"}
     assert math.isfinite(float(ours.loc[leads[0], "at_km"]))  # 首时次有 anchor
 
     # init_pos = 链的种子位置（= lead6 的实况位置）
     seed_lat = float(reference.loc[reference["lead_h"] == 6.0, "obs_lat"].iloc[0])
     seed_lon = float(reference.loc[reference["lead_h"] == 6.0, "obs_lon"].iloc[0])
     assert meta["init_pos"] == pytest.approx([seed_lat, seed_lon])
+    _assert_case_outputs(out, case, meta, "2501", ENS_INIT_ISO, ensemble=True)
