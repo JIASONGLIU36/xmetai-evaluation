@@ -9,8 +9,9 @@
     python -m xmetai_evaluation --list-pipelines            # 看能力清单
     python -m xmetai_evaluation --config my_config.py       # 配置自己声明 pipeline
 
-12 条流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
-验证）、``clim_``（气候，待落地）。每条模板的 ``description`` 就是
+流程按三大业务块统一前缀：``fdp_``（业务天气评测）、``weather_``（天气模型
+验证）、``clim_``（气候，待落地）。条数看 ``PIPELINE_TEMPLATES`` 本身，不在
+这里写死。每条模板的 ``description`` 就是
 ``--list-pipelines`` 打印的内容（含用途、输入数据、计算口径、指标阈值与产出文件），
 所以这里不再另抄一份流程清单。阈值之类的数字直接引用本文件的常量，改常量即生效。
 
@@ -234,14 +235,23 @@ PIPELINE_TEMPLATES: Dict[str, PipelineTemplate] = {
             "降水检验（中国区域站点，cos(lat) 加权）：TS/Bias\n"
             "  用途  中国区站点降水：TS 看命中与空报的折中，BIAS 看整体偏多偏少\n"
             "  数据  预报 格点降水 / 观测 station（Diamond 站点降水）/ 参考 无\n"
-            "  计算  station_valid_time：双线性插值到站；6h 窗口，不经 24h 累积\n"
+            "  计算  station_valid_time：集合平均 → 双线性插值到站；6h 窗口，不经\n"
+            "        24h 累积\n"
             "        区域 15-55N / 70-140E；站点按 cos(lat) 加权\n"
             "        窗口不要求观测完整；按 UTC 对齐\n"
             "        （local_utc_offset_hours=0；默认是北京时 +8）\n"
             "  指标  ts_score  thresholds=[0.1, 13.0, 25.0]\n"
             "        产出 scores.csv、diagnostics/categorical_wide.csv"
         ),
-        transforms=[TransformSpec("grid_to_station", {"method": "bilinear"})],
+        # ``ensemble_mean`` 必须排在 ``grid_to_station`` 前面：站点协议这条路
+        # **没有** Matcher 兜底（格点协议那边 Matcher 的 ensemble_reduction 缺省
+        # 就是 mean；站点协议是把窗口场原样插值到站、member 维一路带进 batch），
+        # 而 ts_score 声明的是 DETERMINISTIC_FIELD —— 留着 member 维会在
+        # Metric.validate 上直接 raise。确定性源（没有 member 维）走这步是空操作。
+        transforms=[
+            TransformSpec("ensemble_mean"),
+            TransformSpec("grid_to_station", {"method": "bilinear"}),
+        ],
         metrics=[MetricSpec("ts_score", {"thresholds": [0.1, 13.0, 25.0]})],
         writers=["csv_long", "categorical_wide"],
         options={

@@ -11,7 +11,11 @@ description: >
   "报告要像论文的实验部分""图下面要有图注""每一节要有总结"时使用。
   也覆盖台风路径/强度检验（"台风路径误差""看看台风预报得怎么样""对比几个模型的台风"）——
   结果目录里是 `tc<编号>_<起报时刻>.csv` + `_meta.json`。
-  覆盖三条链路：降水分类检验（TS 系列，含集合）、确定性连续场 / RMSE 批次家族、台风路径/强度。
+  也覆盖**暴雨过程个例分析**（"降水个例分析""这几个暴雨过程报得怎么样""挑几个过程细看"）
+  ——产物根下一个过程两套段（`{编号}_24h/{起报日}/` 与 `{编号}_total/`），
+  按过程分节、双口径对比。
+  覆盖四条链路：降水分类检验（TS 系列，含集合）、确定性连续场 / RMSE 批次家族、
+  台风路径/强度、暴雨过程个例。
   **能力身份从产物自己认，不靠目录名**；**主模型可以指定，不指定则按目录清单推断**。
   产出：时效曲线、阈值对比、TS 热力图、性能图、跨时效箱线图、谱曲线、多模型差值图，
   以及一份**按论文实验章节组织**的 Markdown 报告——图表就地编号（`图 N` / `表 N`）、
@@ -56,6 +60,10 @@ metadata:
 - "这个 ACC 衰减正常吗""活跃度比接近 1 吗""谱是不是失真了"
 - "**热带 春季 rmse 对比**""北半球夏季的 ACC 谁高"——从已出的长表里
   切一个子集补进报告，**不重跑评测**，走 `references/rmse-batch-evaluation.md` §6
+- "**降水个例分析**做一份""2025 年这几个暴雨过程报得怎么样"
+  "挑几个过程细看，逐日和过程累积都比"——走 `generate_rainstorm_report.py`，
+  `--process` 点名要详析的过程编号（先跑 `rainstorm_summary.py`，
+  用它的 `summary_long.csv` 挑，别解析 `screening.md` 的 markdown）
 
 ---
 
@@ -165,6 +173,7 @@ weather_rmse_single_fgvp    ← RMSE 批次家族
 
 | 看到什么 | 归到 | 走哪条路 |
 |---|---|---|
+| 目录下是 `{编号}_24h/{起报日}/` 与 `{编号}_total/` 两套段，每段内含 `manifest.json` + `diagnostics/` | **暴雨过程个例**（双口径） | `generate_rainstorm_report.py` → `rainstorm_case.md`。**看着像 TS 但别喂给 `generate_report.py`**：单段的 `pipeline` 确实是 `weather_ts_det`，喂进去能跑，出的却是"一次连续时段"的章节口径 |
 | 13 列 TS 表 + `mode: deterministic`（或 `n_members: 1`） | **确定性 TS** | `weather_ts_det` → `weather_ts_single.md` |
 | 同一套表 + `mode: ensemble` / `n_members > 1` | **集合 TS** | `weather_ts_ens` → `weather_ts_ens.md` |
 | 同上，且 `aroc_windows` 非空、目录里有 `*aroc_bss*.csv` | **概率评分也有** | 集合骨架的第六节终于有数据了（见 `precipitation-evaluation.md` §2.1） |
@@ -218,6 +227,14 @@ results/ 下 9 个目录：
 | `grade` 集合对得上？ | 按**共有等级**对齐，缺的记 `—`（`≥250` 这种常缺） |
 | `grade` 列写法一致？ | 归一化后再说（`≥0.1` vs `0.1`） |
 | `tp_scale` / `var` / `interp` / `tz_shift_h` 一致？ | 说明源数据口径不同，**报告里要写进"可比性"声明** |
+| 各模型的**覆盖**（起报日 / 过程 / 时效段）一致？ | **不一致就不能拿"各算各的均值"相减**——两边分母不同，Δ 里混着覆盖率差，不是模型差异。要么只用**共同的那批**，要么把两个分母都写进表题。见下条 |
+
+> **覆盖率不一致时，跨模型汇总的 Δ 不是同分母相减——这条最容易漏。**
+> 渲染器里跨模型求均值用的是 pandas `.mean()`（默认 skipna），
+> **某个模型缺一段，分母就悄悄变小，报表上不会有任何提示**。
+> 实测过一次：一边 43 个过程、另一边 33 个，Δ 从 +0.020 被放大到 +0.041，差一倍。
+> 各家族都可能踩到，只是几个模型通常评同一时段所以不容易触发。
+> 转述 Δ 之前先瞟一眼两边的分母。
 
 ### 第 4 步 · 跑
 
@@ -248,10 +265,48 @@ python skills/xmetai-evaluation/scripts/generate_report.py <主模型产物目�
 > 主模型要么手工 staging，要么如实告诉用户"这一步还得手工接"，
 > **不要假装一键能跑**。
 
+**暴雨过程个例走的是另一个入口**（它吃的是整年的 43 个过程，
+不是 `outputs/results/` 那种一次评测的扁平目录）：
+
+```bash
+python skills/xmetai-evaluation/scripts/generate_rainstorm_report.py \
+  --model FuXi=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fuxi \
+  --model FGVP-ctrl=/workspace/szwCode/evaluation_results/rainstorm_ts_single_fgvp_ctrl \
+  --process 202503,202521 \
+  --result /workspace/szwCode/evaluation_results/rainstorm_report
+```
+
+- `--model NAME=目录` 给的是**产物根**（底下是 `{编号}_24h/` 与 `{编号}_total/`），
+  不是单个过程的目录；第一个是主模型，Δ 一律是「主模型 − 第二个」；
+- `--process` **必给**（逗号分隔的过程编号）。先跑
+  `scripts/rainstorm_summary.py` 拿全 43 个过程的两口径宽表，照着挑要详析哪几个。
+
+挑过程时**读 `summary_long.csv`，不要解析 `screening.md` 的 markdown**：
+`summary_long.csv` 是长表，直接喂 pandas 分组就行；`screening.md` 是给人看的，
+拿 `split('|')` 手写解析**极易列错位**（踩过：口径 B 的列错开一位，
+先算出"33 胜 0 负"的假结论，实际是 22 胜 3 负 8 平）。
+两个产物都在 `--result` 指定的目录下，`screening.md` 只当肉眼扫一遍用。
+
+挑的时候还要**确认对比模型有这一段产物**（`ls <产物根>/{编号}_24h` 与 `{编号}_total`）。
+挑中一段对方根本没有的过程，第三节那个块里 Δ 整列都是「缺」，白占一节。
+另外挑的过程要**两个口径都排得靠前**、且**两个方向都覆盖到**
+（有主模型赢的、也有对比模型赢的），否则报告只证明了一件事。
+
 ### 第 5 步 · 读回报告并转述
 
 打开生成的 `REPORT.md`，向用户**只转述 3–5 条核心结论**（每条都要带具体数值），
 并列出产出的文件。不要整篇复述，也不要在转述里加报告里没有的数字。
+
+**转述之前先做一次数字自洽抽检**（一行 pandas，成本极低、收益很高）：
+凡是「A 列 − B 列 = Δ 列」的表，全表扫一遍
+
+```python
+bad = frame[abs((frame["a"] - frame["b"]) - frame["delta"]) > 1e-6]
+```
+
+有非空结果就是**列错位**或**口径混用**。这一步同时能验你自己的读表脚本
+（`screening.md` 那种手写解析错位就是它逮出来的），也能验报告本身。
+两边分母不一致的问题它逮不到，那条靠上面的"瞟一眼分母"。
 
 **用户给了改动说明时**，还要回答那个他真正关心的问题：
 **"改的这个模块有没有用"**——结论要带代价（哪一档变好了、哪一档变差了）。
@@ -267,6 +322,9 @@ python skills/xmetai-evaluation/scripts/generate_report.py <主模型产物目�
 | `... categorical_wide.csv 不存在` | 评测时没写宽表 writer，让用户改配置重跑 |
 | `manifest.json 不存在` | 用户给的目录不是产物目录（**当前结果目录必然撞这条**，见第 4 步的现状） |
 | `出图需要 matplotlib` | 环境没装：`pip install -e .[viz]` |
+| `... 下既没有 {编号}_24h/ 也没有 {编号}_total/` | 给的不是暴雨过程个例的产物根——该给 `rainstorm_ts_single_*` 配置的 `OUTPUT_ROOT`，不是单个过程的产物目录 |
+| `过程编号 '...' 不在编目里` | `--process` 写错了；有效范围 202501–202543，全表见 `rainstorm_catalog.py` |
+| `至少要两个模型` / `模型名重复` | 对比报告至少要两份产物、且名字不能撞（同名会让表格列对不上号） |
 
 ---
 
@@ -311,6 +369,35 @@ python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --resu
 > 三条 TS 流程写的产物表结构相同，走的是**同一个渲染器** `ts_report.py`。
 > 骨架分成两份，唯一的原因是集合那条**多一类指标**（AROC / BSS），
 > 不是因为流程不同——**模板按家族分、不按流程分**这条原则没变。
+
+> **暴雨过程个例（`rainstorm_case.md`）是唯一的例外：流水线相同、渲染器不同。**
+> 它的每段产物 `pipeline` 也是 `weather_ts_det`，表结构也和 TS 系列一样，
+> 但**产物数量级和分节方式都不是一回事**——一次评测 = 43 个过程 × 2 种口径 =
+> 255 段独立产物，而 `ts_report.py` 假定"一次连续时段评测、一张宽表"，
+> 结构上就吃不下。所以它走独立的 `rainstorm_report.py` + `rainstorm_plots.py`，
+> 报告**按过程分节**而不是按时效分节，入口是
+> `scripts/generate_rainstorm_report.py`（`--model NAME=目录` ≥2 份，
+> `--process` **必给**）。
+>
+> **两种口径互不可比**，报告里两套数分节呈现、只在同一口径内跨模型比：
+> 口径 A（逐日 24h，`{编号}_24h/{起报日}/`）一天一个 08–08 窗、基准率随每日实况浮动；
+> 口径 B（过程累积，`{编号}_total/`）一根预报累加整段、基准率显著更高。
+> 同一个过程的 TS 在两者之间可以差好几倍（实测 202503：≥25mm 口径 A 汇总 0.236、
+> 过程累积 0.313），跨口径比大小没有意义。
+>
+> **口径 A 的过程级数值是「汇总重算」**：把该过程各起报日的
+> hits / misses / false_alarms 加总后按定义再算一次 TS，**不是**各起报日 TS 的
+> 算术平均——TS 是比率，简单平均会让只报出十几个站、TS 恰好为 0 的起报日与
+> 事件上千的起报日等权。渲染器的 `daily_pooled`、`rainstorm_summary.py` 的
+> `pooled_ts` 都是这个定义，改动要两头一起动。
+> 注意 `scores.csv` 里**没有**四格表计数，只有 `diagnostics/categorical_wide.csv`
+> 有，所以做这个汇总必须读后者。
+>
+> 过程编目（编号 → 起止 / 等级）的**真值在主仓库**
+> `xmetai_evaluation/rainstorm_catalog.py`，评测配置、`rainstorm_summary.py`
+> 与渲染器都 import 它；改纪要表改那一份，别在别处再抄一遍。
+>
+> 它**不出降水空间分布**——产物里只有站点列联表的聚合统计，没有逐站或逐格降水量。
 
 ---
 
@@ -391,6 +478,42 @@ REPORT.md
 > 最后那节「图表」**只在出了图时才有**——一张图都没有时它连标题带编号一起消失，
 > 「口径与注意事项」顶上来当第六节，不留空档。
 
+**C. 暴雨过程个例**（`generate_rainstorm_report.py`，`--result` 目录下）：
+
+```
+figures/process_overview_daily.png             43 个过程的口径 A 汇总 TS 分组条形，按主模型降序
+figures/process_overview.png                   43 个过程的过程累积 TS 分组条形，按主模型降序
+figures/<编号>_daily_ts.png                    单个过程的逐日 24h TS，按等级分面、每模型一条线
+figures/<编号>_threshold_ts.png                单个过程的累积 TS 按等级分组条形
+figures/caliber_scatter.png                    逐过程散点：横轴口径 A 汇总 / 纵轴口径 B 累积
+REPORT.md
+```
+
+`REPORT.md` 按**过程**分节（不是按时效）：
+
+```
+一、结论摘要           评估对象 → 本次改动 → **两种口径怎么算**（固定文字 +
+                      两个算出来的基准率）→ 一整段带数值的诊断 → 业务定性
+二、过程清单与挑选依据  表 1 / 表 2（全 43 个过程 × 两个口径的宽表）
+                      + 图 1（口径 A）/ 图 2（口径 B）两张全过程柱状图 → 小结
+三、逐过程分析         每个过程一个块，块含四个小节：
+  3.x.1 过程概况         起报日数、窗长、各口径有效配对数
+  3.x.2 口径 A 逐日 24h   表（逐日原值）+ 图 → 小结（小结报的是汇总值）
+  3.x.3 口径 B 过程累积   表 + 图 → 小结
+  3.x.4 过程小结         两个口径的名次是否一致
+四、跨过程综合对比      表（九项指标等权平均，**逐行只取两边都有有效值的过程**）+ 图（散点）→ 小结
+五、改进建议           每条挂到一个具体数字或过程编号
+六、口径与注意事项      十条，含"跨模型汇总只比同一批过程""本报告不含降水空间分布"
+```
+
+> **第三节的块数量 = `--process` 给的编号个数**，块内的表号、图号**跨块连续不重置**。
+> 骨架 [`rainstorm_case.md`](./assets/templates/rainstorm_case.md) 只画了一个块，
+> 写的是 `3.{x}` / `表 {N}` 这类占位，**不要照抄成固定的 `3.1` / `表 3`**。
+>
+> **`assets/templates/` 的测试不覆盖这一份**——`tests/` 在另一个工作副本里，
+> 这个副本没有测试。骨架靠人工与 `rainstorm_report.py` 的静态文字对齐，
+> 改渲染器正文时两边要一起改。
+
 ---
 
 ## 硬性规则
@@ -454,6 +577,12 @@ REPORT.md
 | 要判断谱是"总量正常但分布失真" | 只用 `spectrum_power_ratio` 看不出来（它是全波数求和后的比值）；用 `--spectrum-variable` / `--spectrum-lead` 出谱曲线看高波数段 |
 | 用户点名一个切片（"热带 春季 rmse 对比"） | 走 `references/rmse-batch-evaluation.md` **§6**：长表筛选 + 按既有口径重算，**不重跑评测**；季节按**起报时刻**切、DJF 按气象冬季归。渲染器不认这类请求，段落由智能体自己补 |
 | 用户要的季节/纬度带上，长表里没有现成一列 | 季节从 `init_time` 推（§6.2）；纬度带本来就有 `region` 列（空 = 全球）。两者都不需要改评测配置 |
+| 用户要"降水个例分析"但没说看哪几个过程 | 先跑 `rainstorm_summary.py`（43 个过程 × 两口径 × N 模型的挑过程总表 + 排序参考），**读它的 `summary_long.csv` 挑**；**`--process` 必给**，43 个全出会变成一本册子 |
+| 两个产物根的**过程覆盖不一样** | 跨模型汇总的 Δ 就不是同分母相减（实测差一倍）。渲染器已按「只用双方都有产物的过程」算，表题会给出该批过程数；转述时要说明，别把 Δ 当纯模型差异 |
+| 用户想比"这个过程的 TS"，但两个数一个 0.21 一个 0.61 | 那是**两种口径**（逐日 24h 汇总 / 过程累积），基准率不同，**互不可比**——先问清看哪个口径，或两个都出、分节呈现 |
+| 用户说口径 A 的每过程值应当"把所有报的 hit 汇到一起重算"，而产物/脚本给的是逐日平均 | 用户是对的：TS 是比率，平均比率会被小样本日拖偏。渲染器用 `daily_pooled`、`rainstorm_summary.py` 用 `pooled_ts`，两处定义必须一致；`scores.csv` 没有四格表计数，得读 `diagnostics/categorical_wide.csv` |
+| 降水个例报告里没有落区图 | **不是漏做**。产物里只有站点列联表的聚合统计（hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格降水量，画不出实况场也画不出差值场；要看落区得回头读原始预报 nc 与站点报文 |
+| 用户说"202519 和 202520 数字一模一样，是不是重复了" | 纪要表把同一时段的两个侧面分列两条，**各评各的、不合并**，数字相同属正常（编目模块的 docstring 里记着这条） |
 
 ---
 
@@ -467,8 +596,9 @@ REPORT.md
   `assets/templates/weather_rmse_ens.md`（集合）、`assets/templates/weather_rmse_wave.md`（谱检验补充分析）
 - 台风路径/强度：`assets/templates/weather_typhoon_single.md`（单成员）、
   `assets/templates/weather_typhoon_ens.md`（集合，方案 A/B + 离散度）
+- 暴雨过程个例：`assets/templates/rainstorm_case.md`（双口径 × 多模型，按过程分节）
 
-> `assets/templates/` 现在只剩上面七份。**确定性连续场（`weather_field_scores`）
+> `assets/templates/` 现在有上面八份。**确定性连续场（`weather_field_scores`）
 > 的骨架与模板目录的 `README.md` 都已删除**——能力本身、渲染器、判读规则
 > （`references/field-evaluation.md`）都还在，只是格式契约没有真值来源了。
 
@@ -489,9 +619,15 @@ REPORT.md
 - **渲染逻辑在主仓库**：`visualization/`
   （`precipitation_plots.py` + `ts_report.py` 管 TS 链路，
   `field_plots.py` + `field_report.py` 管连续场链路，
-  `det_report.py` 管 RMSE 批次家族，`report.py` 负责"认能力 + 派发"）。
+  `det_report.py` 管 RMSE 批次家族，`rainstorm_plots.py` + `rainstorm_report.py`
+  管暴雨过程个例，`report.py` 负责"认能力 + 派发"）。
   改能力改主仓库——那里能被 pytest 覆盖。
   规则与代码的对应关系写在 references 里，**冲突时以代码为准**。
+- **过程编目只有一份真值**：`xmetai_evaluation/rainstorm_catalog.py`
+  （编号 → 起止 / 等级，43 条）。评测配置 `configs/rainstorm_ts_single_*`、
+  `scripts/rainstorm_summary.py`、渲染器全都 import 它。
+  历史上这个过程表在配置文件与汇总脚本里各抄了一份，改一头另一头不跟着动——
+  **加新过程、改起止，只改编目模块**，`process_tuples()` 会自动铺到两边。
 - **`scripts/generate_report.py` 只做入口**（插 `sys.path` → 调 `build_report` → 打印产物）。
   **不要往里加判断逻辑**：一旦它开始自己认能力、自己拼流程，
   就又变成一份会跟主仓库漂移的副本。
@@ -514,7 +650,13 @@ REPORT.md
      ——**重跑评测即可**，不是报告端的问题。见 `references/rmse-batch-evaluation.md` §5.6；
   5. **台风两份骨架的渲染器还没做**（`weather_typhoon_single` / `_ens`）。
      而且 `weather_typhoon_ens.md` 里的列名**全部是从 `core/tc_ref.py` 的集合分支
-     读出来的，不是实拍**——第一次真跑之后要拿真实表头回来核一遍。
+     读出来的，不是实拍**——第一次真跑之后要拿真实表头回来核一遍；
+  6. **暴雨过程个例的骨架没有测试守着**。`tests/` 不在 v2 这个工作副本里，
+     `rainstorm_case.md` 靠人工与 `rainstorm_report.py` 的静态文字对齐；
+     真跑一遍对骨架是**目前唯一的验收手段**（本地已用同一份产物喂两个模型名跑通，
+     Δ 列全是 `+0.000`，但渲染路径与编号连续性都验证过了）。
+     另外 `rainstorm_summary.py` 缺 `stream.reconfigure(encoding="utf-8")` 那段，
+     Windows 的 GBK 控制台下中文输出会变成乱码——**产物本身是 UTF-8，不受影响**。
 - `agents/` 目前是空的。
 - **本目录是源，`.claude/skills/` 下的是副本**（Windows 建符号链接要管理员权限，
   所以用复制）。改完这里要重新复制过去，见 `skills/README.md`。

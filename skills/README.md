@@ -19,6 +19,7 @@
 | `weather_field_scores` | 确定性连续场：RMSE / ACC / 预报活跃度 / 纬向谱 | ⚠️ 能力与渲染器在，格式契约骨架已删（单模型报告走 `generate_report.py`） |
 | TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
 | RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`，外加谱检验补充报告） | 格点 RMSE / ACC / FA / 纬向谱，**多模型横向对比** | ✅ 三份骨架 + 三个渲染器都做了（`generate_det_report.py` / `_ens_` / `_wave_`） |
+| 暴雨过程个例（`rainstorm_ts_single_<模型>`） | 2025 年 43 个暴雨过程 × **双口径**（逐日 24h / 过程累积）的站点 TS | ✅ 骨架 + 渲染器都做了（`generate_rainstorm_report.py`）。**流水线同为 `weather_ts_det`，但产物形状不同，走独立入口** |
 | 其余流程（CRPS、FSS、概率评分、台风…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
 **能力身份自动识别**：给一个评测产物目录，skill 从 `manifest.json` 的
@@ -84,7 +85,9 @@ skills/
     │   ├── generate_report.py   # 产物目录 → 图表 + REPORT.md（认能力 + 派发）
     │   ├── generate_det_report.py    # 批次归档（单成员）→ 多模型对比图 + REPORT.md
     │   ├── generate_ens_report.py    # 批次归档（集合）→ 同上，另加 CRPS/Spread
-    │   └── generate_wave_report.py   # 批次归档（谱检验补充）→ 同上，另加球谐带
+    │   ├── generate_wave_report.py   # 批次归档（谱检验补充）→ 同上，另加球谐带
+    │   ├── rainstorm_summary.py      # 43 个过程 × 2 口径 × N 模型 → 挑过程总表（CSV + 宽表）
+    │   └── generate_rainstorm_report.py  # 暴雨过程个例产物根 → 多模型对比报告（按过程分节）
     ├── assets/
     │   └── templates/           # 报告格式契约（按能力家族一份，名字按 config 命名）
     │       ├── weather_ts_single.md    # 确定性降水检验：三份填空骨架（单模型 / 单基准 / 多模型）
@@ -93,7 +96,8 @@ skills/
     │       ├── weather_rmse_ens.md     # RMSE 批次家族（集合）：CRPS / Spread / Spread÷RMSE
     │       ├── weather_rmse_wave.md    # 纬向 FFT + 球谐带功率谱补充分析：一份骨架
     │       ├── weather_typhoon_single.md  # 台风路径/强度（确定性）
-    │       └── weather_typhoon_ens.md     # 台风路径/强度（集合口径 + 离散度）
+    │       ├── weather_typhoon_ens.md     # 台风路径/强度（集合口径 + 离散度）
+    │       └── rainstorm_case.md          # 暴雨过程个例：双口径 × 多模型，按过程分节
     ├── references/              # 参考文档（口径与判读规则）
     │   ├── evaluation-metrics.md        # 指标词典：是什么（不判好坏）
     │   ├── precipitation-evaluation.md  # TS 系列：口径与产出契约
@@ -683,7 +687,73 @@ skills/
   - **另一件没解决的事**：这份骨架**没有测试守着**（`test_weather_rmse_wave.py`
     不存在，且 `tests/` 本身没进版本库），改动只能靠实跑对拍
 
+- **2026-10-08**: 新增「降水个例分析」骨架与渲染器（暴雨过程个例，双口径）
+  - **新增第四类交付物**：`assets/templates/rainstorm_case.md` +
+    `visualization/rainstorm_report.py` + `rainstorm_plots.py` +
+    `scripts/generate_rainstorm_report.py`。它吃的是
+    `configs/rainstorm_ts_single_*` 的产物根——一个过程两套段
+    （`{编号}_24h/{起报日}/` 与 `{编号}_total/`），一次评测 43 个过程 ×
+    2 种口径 = 255 段独立产物，报告**按过程分节**（不是按时效分节）
+  - **流水线相同、渲染器不同**：每段产物的 `pipeline` 也是 `weather_ts_det`、
+    宽表列名也和 TS 系列一样，但 `ts_report.py` 假定"一次连续时段评测、
+    一张宽表"，结构上吃不下这批产物。所以它走独立渲染器，
+    **不能喂给 `generate_report.py`**（喂得进去、出的却是错的章节口径）。
+    这是"模板按家族分、不按流程分"原则之外的第一处例外，已在 SKILL.md 写明
+  - **两种口径互不可比**，报告里两套数分节呈现、只在同一口径内跨模型比：
+    口径 A（逐日 24h）一天一个 08–08 窗、基准率随每日实况浮动；
+    口径 B（过程累积）一根预报累加整段、基准率显著更高。实测 202503 的
+    ≥25mm TS：日均 0.210 vs 过程累积 0.313
+  - **过程编目收敛到一份真值**：新增 `xmetai_evaluation/rainstorm_catalog.py`
+    （43 条：编号 → 起止 / 等级）。此前配置 `rainstorm_ts_single_fuxi.py`、
+    `rainstorm_ts_single_fgvp_ctrl.py` 与 `rainstorm_summary.py` **各抄了一份
+    46 行的过程表**，改一头另两头不会跟着动；现在三处都 `import` 编目模块，
+    重构后逐一核对过 43 个过程 / 255 个 cfg / 输出路径逐项相同
+  - **`--process` 必给**：43 个过程全出会变成一本册子，所以要求显式点名；
+    先跑 `rainstorm_summary.py`、读它的 `summary_long.csv` 照着挑
+  - **跨模型汇总逐行配对，保证 Δ 两边同分母**：一边缺段时「各算各的均值」是两个
+    分母，Δ 里混着覆盖率差。首次实跑（FuXi 43 个过程 vs FGVP-ctrl 33 个）就撞上，
+    Δ 从 +0.020 被放大到 +0.041。修法是**逐行只取两边都有有效值的过程**
+    （`_paired_values`），不是只按「有没有产物」筛——后者仍会漏：
+    202534 的 FGVP 只有 `_24h`、没有 `_total`，按产物筛那一行照样是两个分母。
+    修后 表 15 的 Δ 与独立复算逐位一致（口径 B +0.020、口径 A +0.034）。
+    同步在第六节加了第 3 条口径说明，并把「九条」改成「十条」
+  - **不出降水空间分布**：产物里只有站点列联表的聚合统计
+    （hits / misses / false_alarms / n_pairs / TS…），没有逐站或逐格降水量，
+    画不出实况场也画不出差值场。这件事三种查法都验过（配置的 `writers`、
+    `manifest.artifacts`、`.states/*.pkl` 反序列化），报告第六节第 8 条写明
+  - **第一节补了「两种口径怎么算」**：把两种口径的算法写进摘要（窗口怎么切、
+    往不往上累加、四格表怎么出、「日均」为什么是逐日 TS 的算术平均而不是合并
+    四格表），并给出那个最有说服力的反例——「8 天每天 8mm 的连绵小雨」与
+    「1 天 60mm 的一场暴雨」在口径 B 眼里完全相同。计算方式是**配置层面的事实**
+    （跟模型、跟产物无关）所以写死；只有末尾两个基准率是跟着产物算的
+    （`_base_rate` / `_base_rate_mean`），骨架上留 `{…}`。实测一批：
+    口径 A 逐日平均 5.1%、口径 B 逐过程平均 28.7%，差 5.6 倍——
+    这就是「TS 不可跨口径比」的定量依据
+  - **口径 A 的过程级数值改成「汇总重算」**（2026-10-08）：原来是各起报日 TS 的
+    算术平均，用户指出应当把该过程所有起报日的 hit/miss/FA 汇到一起重算——
+    平均比率会被小样本日拖偏。渲染器新增 `daily_pooled` / `daily_counts` /
+    `_from_counts`，`daily_mean` 删掉；`rainstorm_summary.py` 新增 `pooled_ts` /
+    `load_wide` / `_wide_counts`。注意 **`scores.csv` 里没有四格表计数**，
+    汇总必须读 `diagnostics/categorical_wide.csv`。实测影响：202501 ≥25mm
+    0.110→0.191、43 过程整体 0.273→0.316（FuXi）；Δ 从 +0.028 变 +0.022。
+    基准率对算法不敏感（逐日平均 5.1% vs 逐过程汇总 5.1%），因为各日起报的
+    n_pairs 几乎相同，所以那两个 {…} 数字没变
+  - **第二节补了第二张图**：原来只有口径 B 的全过程柱状图，现在口径 A 一张
+    （`process_overview_daily.png`，图 1）、口径 B 一张（`process_overview.png`，
+    图 2），`plot_process_overview` 加 `metric_label` 参数（只改文字）；
+    第三节起的图号整体后移一位
+  - **这个骨架没有测试守着**：`tests/` 不在 v2 这个工作副本里，靠实跑对拍
+    （已用同一份产物喂两个模型名跑通两个过程，图号表号连续、
+    Δ 列全 `+0.000` 属预期的退化形状；改渲染器后又用
+    「骨架非占位行必须逐字出现在 REPORT.md 里」扫过一遍：26 行、0 缺失）
+  - **改进建议的分支要覆盖「两个口径都领先」**：原来 `if 总量赢且逐日不赢 / elif
+    总量输 / else`，`else` 兜底写的是「两种口径都接近持平」——主模型两个口径都
+    明显领先时也落进 `else`，实测输出成「接近持平（口径 B 22:3，口径 A 29:3）」。
+    已拆成五条分支，「持平」只留给总量真正持平的情形
+  - 已知遗留：`rainstorm_summary.py` 缺 `stream.reconfigure(encoding="utf-8")`
+    那段，Windows 的 GBK 控制台下中文输出乱码（**产物本身是 UTF-8，不受影响**）
+
 ---
 
 **维护者**: 沈哲文 (szw)
-**最后更新**: 2026-09-22（续七）
+**最后更新**: 2026-10-08

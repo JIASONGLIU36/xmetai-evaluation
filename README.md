@@ -11,22 +11,28 @@ xmetai-inference → 预报产品文件 → xmetai-evaluation → 评测结果�
 ## 能力边界
 
 - 输入预报：NetCDF 格点场（FuXi 确定性 / FuXi 集合 / Fengqing）。
-- 输入观测/参考：Diamond 站点观测、CRA40 再分析、CRA 气候态。
+- 输入观测/参考：Diamond 站点观测、BABJ 台风路径报文、CRA40 再分析、ERA5 zarr、
+  CRA 气候态、日序气候态、BSS 气候概率。
 - 产品类型：确定性场、集合成员场、概率产品。
-- 输出：`scores.csv` 长表、分类/概率宽表、JSON 快照、覆盖率；可选图件。
+- 评测对象：格点/站点连续量、降水分类与概率、集合标定、**台风路径与强度**。
+- 输出：`scores.csv` 长表、分类/概率宽表、台风逐场次路径表、JSON 快照、覆盖率；可选图件。
 
 ## 快速开始
 
 ```bash
 pip install -e .
-
+cd xmetai-evalation-v2
 # 看有哪些评测功能
-xmetai-eval --list-pipelines
+python -m xmetai_evaluation.cli --list-pipelines         
 
 # 开始评测（配置可以是内置名，也可以是 .py 路径；数据路径由环境变量提供）
-xmetai-eval --config weather_ts_ens_fuxi
+python -m xmetai_evaluation.cli --config weather_rmse_single_fgvp --log-file /workspace/szwCode/evaluation_results/weather_rmse_single_fgvp_ctrl/smoke_tp.log
 
-output /workspace/data/worm/tmp_result/_XMETAI_test_results_single 
+# --log-file 可省略：省略后日志只打到控制台（INFO 级），不落文件；
+# --config 可以更换，如 weather_rmse_single_fgvp
+
+# 测试
+python -m pytest tests/integration/test_fdp_fengqing_realdata.py -m realdata
 ```
 
 ## 目录结构
@@ -555,11 +561,11 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 
 | 类型 | 注册名 |
 |---|---|
-| Reader | `fuxi`、`fuxi_ens`、`fengqing`（及 `fuxi_phys`/`fuxi_ens_phys`/`fengqing_phys` 单位变体）、`cra`、`era5_zarr`、`station`（`diamond_station` 别名）、`climatology`、`daily_climatology`、`ref_probability` |
+| Reader | `fuxi`、`fuxi_ens`、`fengqing`（及 `fuxi_phys`/`fuxi_ens_phys`/`fengqing_phys` 单位变体）、`cra`、`era5_zarr`、`station`（`diamond_station` 别名）、`babj`（BABJ 台风路径报文）、`climatology`、`daily_climatology`、`ref_probability` |
 | Transform | `grid_to_station`、`time_window_accumulator`、`ensemble_mean` |
-| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum`、`spherical_bands` |
-| Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格） |
-| Writer | `csv_long`（始终写出）、`coverage`、`details`、`json`、`categorical_wide`、`probability_wide` |
+| Metric | `rmse`、`bias`、`acc`、`acc_uncentered`、`ts_score`、`ensemble_probability`、`crps`、`spread_error`、`fss`、`activity`、`spectrum`、`zonal_spectrum`、`spherical_bands`、`track_error`、`track_error_ens` |
+| Protocol | `station_valid_time`（插值到站点，按有效时刻配对）、`grid_valid_time`（插值到实况网格）、`typhoon_track`（链式诊断台风中心，对 BABJ 配对）、`typhoon_track_ens`（同上前者逐成员，批次带成员轴） |
+| Writer | `csv_long`（始终写出）、`coverage`、`details`、`json`、`categorical_wide`、`probability_wide`、`spectrum`、`typhoon_cases` |
 
 ## 评测能力清单
 
@@ -587,6 +593,8 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | **确定性连续量检验**<br>`weather_field_scores` | 格点场预报（`fuxi`，z500 等）+ 格点实况 + 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `rmse`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`（纬向谱）、`spherical_band_power_forecast/observation/ratio`（球谐带，group 列分频带）<br>逐波数谱曲线另出宽表 | 重·参考·整场 · processes |
 | **集合连续评分**<br>`weather_ens_crps` | 集合格点场预报（`fuxi_ens`）+ 格点实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` | 重·成员 · processes |
 | **集合场检验**<br>`weather_ens_field_scores` | 集合格点场预报（`fuxi_ens`）+ 格点实况（ERA5）+ 气候态（ACC/活跃度必需） | `scores.csv`、`diagnostics/spectrum_{var}.csv`、`diagnostics/spectrum_by_init.csv` | `rmse`、`crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio`、`acc`、`activity_ratio`、`activity_forecast`、`activity_observation`、`activity_bias`、`spectrum_power_ratio`、`spherical_band_power_*`<br>谱曲线同 `weather_field_scores` | 重·参考·成员·整场 · processes |
+| **台风路径与强度检验（确定性）**<br>`weather_typhoon_det` | 确定性格点预报（`fuxi_phys`，msl 必给；u10m/v10m 给不了就没有强度项）+ BABJ 路径报文（`babj`，diamond7） | `scores.csv`、`typhoon/tc<编号>_<起报>.csv`（逐时效 15 列）、`_meta.json`、`typhoon/typhoon.csv`（全场合拼） | `track_err_km`、`at_km`、`ct_km`、`wind_err_ms`、`pmin_err_hpa`<br>逐 场次（台风 × 起报）：每项一个时效均值；逐时效曲线在路径表里，不进长表 | 轻 · threads（配置改 processes：瓶颈是读盘不是算） |
+| **台风路径与强度检验（集合）**<br>`weather_typhoon_ens` | 集合格点预报（根目录按起报分日期目录，日期目录下放 `member_*/`；msl 必给）+ BABJ 路径报文 | 同上（路径表多 `n_members`/`n_valid_members`） | 确定性那 5 项 + `track_err_km_a`、`at_km_a`、`ct_km_a`<br>无后缀 = 方案 B（各成员位置先平均，再与实况求误差）；`_a` = 方案 A（各成员先各算误差，再对成员平均）。两者只在路径三项上有别；强度两项代数恒等，只出一行 | 轻·成员 · threads（配置改 processes） |
 | **集合连续评分**<br>`fdp_ens_crps` | 集合格点场预报（`fengqing`）+ CRA40 再分析实况 | `scores.csv` | `crps`、`spread`、`rmse`（集合平均场）、`spread_error_ratio` | 重·成员 · processes |
 | **要素场检验**<br>`fdp_field_scores` | 格点场预报（`fengqing`，z500 等）+ CRA40 实况 + 气候态（可选，ACC 必需） | `scores.csv` | `rmse`、`bias`、`acc` | 轻·参考 · threads |
 | **中国区站点降水检验**<br>`fdp_precip_ts` | 格点降水预报 + Diamond 站点降水观测（中国区，cos 纬度加权） | `scores.csv`、`diagnostics/categorical_wide.csv` | `ts`、`pod`、`far`、`miss_rate`、`frequency_bias`<br>逐 阈值（0.1/13/25 mm）× 6h 时效（UTC 对齐，窗口不要求观测完整） | 轻 · threads |
@@ -642,6 +650,25 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `spherical_band_power_observation` | 球谐带功率（实况侧） | 同上 | 同上 |
 | `spherical_band_power_ratio` | 球谐带功率比 | 预报带功率 / 实况带功率，逐带一行 | ≈1 标定良好；小波数带偏低 = 大尺度系统性衰减，大波数带偏高 = 噪声过剩 |
 
+台风路径与强度（逐时效算完再对时效取均值；逐时效的完整曲线在 `typhoon/tc*.csv`，
+不进长表）：
+
+| 指标 | 含义 | 口径 | 方向 |
+|---|---|---|---|
+| `track_err_km` | 路径误差：预报中心与实况中心的距离 | 大圆距离；预报中心由链式搜索最低气压中心得到 | 越小越好（km） |
+| `at_km` | 沿路径误差：误差在「路径前进方向」上的投影 | 以**前一个配对时效的实况位置**定向；>0 = 报快了 | 0 为无偏；**首时次为空**（没有前一个位置就无从定向） |
+| `ct_km` | 横路径误差：误差在「路径侧向」上的投影 | 同上定向框架 | 0 为无偏 |
+| `wind_err_ms` | 最大风速误差 | 诊断中心 ±`intensity_half_deg` 方框内最大 10m 风速（由 `u10m`/`v10m` 现合成）− 实况；给不出风速通道则整列留空 | 0 为无偏（m/s） |
+| `pmin_err_hpa` | 中心气压误差 | 诊断中心最低气压 − 实况（hPa） | 0 为无偏 |
+| `track_err_km_a` | 同 `track_err_km`，但走**方案 A** | 各成员先各算误差、再对成员平均（集合链专有） | 同 `track_err_km` |
+| `at_km_a` / `ct_km_a` | 同 `at_km` / `ct_km`，方案 A | 同上 | 同上 |
+
+长表里**无后缀的是方案 B**（各成员位置先平均成集合平均位置，再与实况求误差），
+`_a` 才是方案 A。两者只在路径三项上有差别——三角不等式使然；强度两项
+（`wind_err_ms`/`pmin_err_hpa`）两方案代数恒等，只出一行。
+**两条链的首时次 `at`/`ct` 口径不同**：确定性链一贯留空，集合链用**起报时刻实况**
+当定向基准（各对齐各自的历史归档，别按其中一条的直觉改另一条）。
+
 几个读表要点：
 
 - **长表只放标量。** 列联表计数（`hits`/`misses`/`false_alarms`/`correct_negatives`/`n_pairs`）、
@@ -669,7 +696,16 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 
 一条流程模板只有**一个时间窗口**（`station_valid_time` 的 `window_hours` 同时决定观测累积长度和有效时效的筛选），所以集合降水检验按口径拆成了两条：24h 的 `weather_ts_ens` 出 TS 系列，6h 的 `weather_ts_ens_prob` 出概率评分。`weather_ts_ens_fuxi` 配置用 `pipeline=["weather_ts_ens", "weather_ts_ens_prob"]` 一条命令跑完两段，结果合并落同一个 `output_dir`（`scores.csv` 里靠 `window_h` 列区分，两个宽表各取自己那一段）。
 
-> 台风路径/强度检验（`ref/tiqnqi/xmetai_model_verification_xu/run_tc.py`：台风中心诊断 + babj 实况配对 + 路径/强度误差）尚未吸收进框架，属待办 gap。
+台风链的两条硬约束（配置里已写死，改错会直接报错、不会出假数）：
+
+- **`lead_chunk_days` 必须是 0。** 中心诊断是**链式**的——每一时效的搜索框中心是上一
+  时效**诊断出的位置**，不是实况位置；时效被切开后后一块接不上，只能退回实况位置重起，
+  结果会静默偏掉。所以一个场次（台风 × 起报）的整段时效必须落在同一个工作块里。
+- **观测的 BABJ 只能 `slice` 装载。** 报文是北京时、一条报文跨台风的**整条生命史**，
+  按起报时刻切会把实况切没；`resident`/`window` 会被计划层直接拦下。
+
+集合链**逐成员串行读**（一次只驻留一个成员的场），峰值内存与确定性链同级，代价是每块
+耗时 ×成员数。旧实现见 `ref/tiqnqi/xmetai_model_verification_xu/run_tc.py`。
 
 输出文件口径：
 
@@ -682,9 +718,26 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `diagnostics/spectrum_by_init.csv` | 逐波数功率谱的逐起报曲线（同上） |
 | `diagnostics/categorical_wide.csv` | 分类检验宽表（阈值 × 时效：TS/POD/FAR/漏报率/BIAS + `hits`/`misses`/`false_alarms`/`n_pairs` 计数） |
 | `diagnostics/probability_wide.csv` | 概率评分宽表（阈值 × 时效：AROC/BS/BSS + `BS_ref`/`base_rate`/`n_points`） |
+| `typhoon/tc<编号>_<起报>.csv` | 台风逐时效路径表（15 列：起止时刻、预报/实况经纬度与强度、五项误差；集合链另加 `n_members`/`n_valid_members` 与方案 A 三列）（声明 `typhoon_cases` writer 时写出） |
+| `typhoon/tc<编号>_<起报>_meta.json` | 该场次的元信息：台风编号/中文名/起报时刻、起报点实况位置、种子偏移、搜索参数、成员名与成员数 |
+| `typhoon/typhoon.csv` | 全部场次拼接总表（渲染路径图与人工核对用） |
 | `scores.json` | 评分 JSON 快照 |
 
-当前已接好的内置任务配置（`configs/`）：`weather_ts_single_fgvp`（FGVP 确定性降水）、`weather_ts_ens_fuxi`（FuXi 集合降水，24h TS + 6h 概率两段一趟跑完）、`weather_rmse_single_fuxi`（FuXi 确定性连续量）、`weather_rmse_ens_fuxi`（FuXi 集合场，含 CRPS/Spread）、`fdp_rmse_single_fengqing`（FDP 要素检验）。批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
+当前已接好的内置任务配置（`configs/`）：
+
+| 配置 | 干什么 |
+|---|---|
+| `weather_ts_single_fgvp` | FGVP 确定性降水分类检验 |
+| `weather_ts_ens_fuxi` | FuXi 集合降水：24h TS + 6h 概率两段一趟跑完 |
+| `weather_rmse_single_fuxi` / `_fgvp` | 确定性连续量（RMSE/谱/ACC/活跃度） |
+| `weather_rmse_ens_fuxi` / `_fgvp` | 集合场（RMSE/CRPS/Spread/ACC/活跃度/谱/球谐带） |
+| `weather_typhoon_single_fuxi` | 台风路径与强度（确定性 × BABJ） |
+| `weather_typhoon_ens_fuxi` | 台风路径与强度（集合，方案 A/B 一次算清） |
+| `fdp_rmse_single_fengqing` / `fdp_rmse_ens_fengqing` | FDP 要素检验（确定性 / 集合） |
+| `fdp_precip_single_fengqing` / `fdp_precip_ens_fengqing` | FDP 降水站点检验（确定性 TS/频率偏差 / 集合概率 BS/AROC/BSS） |
+| `rainstorm_ts_single_fuxi` / `_fgvp_ctrl` | 暴雨过程分档检验：走 `weather_ts_det`，逐过程展开起报，过程编目（43 个过程，编号/起止/等级）的唯一真值在 `rainstorm_catalog.py` |
+
+批量多模型见上「批量评测」——写一份 `cfgs` 列表即可，无内置示例。
 
 ## 评测数据与格式
 
@@ -704,6 +757,8 @@ echo "已用: $(cat /sys/fs/cgroup/memory.current)"
 | `weather_ens_field_scores` | 集合预报（`fuxi_ens` / `fengqing`） | `era5_zarr` | 日气候态（ACC / 活跃度必需） |
 | `fdp_ens_crps` | `fengqing`（集合） | `cra` | — |
 | `fdp_field_scores` | `fengqing` | `cra` | `climatology`（ACC 需要） |
+| `weather_typhoon_det` | 格点预报（`msl` 必给；`u10m`/`v10m` 可选） | `babj` 报文 | — |
+| `weather_typhoon_ens` | 集合格点预报（**日期目录下带 `member_*/`**） | `babj` 报文 | — |
 | `fdp_precip_ts` | 格点降水预报 | `station`（中国区） | — |
 | `fdp_precip_fss` | 格点降水预报 | **格点**降水实况（当前内置 `cra`） | — |
 | `fdp_activity_spectrum` | `z500` 格点预报 | 格点实况 | `climatology`（活跃度比必需） |
@@ -788,6 +843,22 @@ observation_reader={
 - 通道名旁挂在 store 同级目录的 `channel_names.json` 里；**没有层次轴**，层次编码在
   通道名里（`z_500`、`u_200`），配置侧仍写标准名。
 - 气压层走 `pl`、地面走 `sfc`（`groups` 已声明）；GRIB 缺测哨兵 `1e30` 当缺测。
+
+**BABJ 台风路径报文**（`babj`）——记录台风**最佳路径**的业务分析报文：
+
+```
+{root}/babj2501.dat        # 编号 2501 台风，一个文件 = 一整条路径
+```
+
+- diamond7 格式、**GBK** 编码、空白分隔，时刻是**北京时**。一个文件横跨多天
+  （台风的整条生命史），不是「一个文件一个时刻」——所以本 reader **不做时间筛选**，
+  `discover` 一把全给、`read` 一次全读（报文以十计、体量 KB 级），由协议按编号取用。
+  `root_dir` 也可以直接指到单个 `.dat`。
+- 只取报文里**时效 000** 的行当分析实况，输出 `(time, storm)` 的
+  `lat`/`lon`/`pmin`/`vmax`；坐标 `storm` 是编号字符串、`tcname` 是中文名。
+- **各台风的实况时刻不对齐**：`time` 取并集，缺的位置是 NaN（取用时按
+  `.sel(storm=…, time=…)`，NaN 即「该时刻无实况」）。预报侧对不上实况的时效
+  **不外推不插值，留空**。
 
 ### 参考
 

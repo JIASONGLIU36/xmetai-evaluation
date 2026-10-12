@@ -346,10 +346,12 @@ def _metric_activity(**params):
     return ActivityRatio(params)
 
 
-def _metric_spectrum(max_wavenumber: int = 30, **params):
+def _metric_spectrum(max_wavenumber: int = 30, lat_order=None, **params):
     from xmetai_evaluation.metrics.specialized import PowerSpectrum
 
-    return PowerSpectrum(max_wavenumber=int(max_wavenumber), params=params)
+    return PowerSpectrum(
+        max_wavenumber=int(max_wavenumber), lat_order=lat_order, params=params
+    )
 
 
 def _metric_zonal_spectrum(max_wavenumber: int = 30, **params):

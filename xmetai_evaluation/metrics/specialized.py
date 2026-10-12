@@ -248,13 +248,37 @@ class ActivityRatio(Metric):
 
 
 class PowerSpectrum(Metric):
-    """纬向功率谱（对原始场）：曲线进明细表，总功率比进长表。"""
+    """纬向功率谱（对原始场）：曲线进明细表，总功率比进长表。
+
+    ⚠ 这个谱函数**对纬度朝向敏感**，不是换行序那么无害：相位项
+    ``exp(-2πi·l·i/M)`` 里的 ``l`` 是数组**行号**（0,1,2,…）而不是纬度值，
+    同一纬度翻转后拿到不同的行号，逐波数的 ``P(k)`` 就变了（不是差一个常数
+    倍数，是逐波数各差各的，奇数波数能差到 2 倍）。
+
+    默认 ``lat_order=None`` = **按传进来的形态原样算**，也就是既有行为 ——
+    weather 全系列的谱逐位不变。要跟标准脚本
+    ``activity_spectrum_verifier.py`` 对表，就在 metric_options 里写
+    ``"spectrum": {"lat_order": "descending"}``：它把模式场和实况**都归到
+    纬度降序**（90 → −90）再算，而框架侧通常是升序（−90 → 90）。
+    """
 
     PRODUCT_KIND = "specialized"
 
-    def __init__(self, max_wavenumber: int = DEFAULT_MAX_WAVENUMBER, params=None):
+    def __init__(
+        self,
+        max_wavenumber: int = DEFAULT_MAX_WAVENUMBER,
+        lat_order: Optional[str] = None,
+        params=None,
+    ):
         super().__init__(name="spectrum", version="1.0.0", params=params or {})
         self.max_wavenumber = int(max_wavenumber)
+        if lat_order not in (None, "ascending", "descending"):
+            raise MetricError(
+                f"spectrum 的 lat_order 只能取 None（按原样）/ 'ascending' / "
+                f"'descending'，收到 {lat_order!r}",
+                variable="spectrum",
+            )
+        self.lat_order = lat_order
 
     def requirements(self) -> MetricRequirements:
         return MetricRequirements(
@@ -262,9 +286,34 @@ class PowerSpectrum(Metric):
             variables=["*"],
         )
 
+    @staticmethod
+    def _lat_values(source):
+        """从 batch 那一侧取纬度坐标；取不到返回 None（那就无从判断朝向）。"""
+        payload = getattr(source, "payload", source)
+        coords = getattr(payload, "coords", None)
+        if coords is not None and "lat" in coords:
+            return np.asarray(coords["lat"].values, dtype="f8")
+        return None
+
+    def _oriented(self, values, source):
+        """按 ``self.lat_order`` 把场归到指定纬度朝向。
+
+        只有配置显式写了 ``lat_order`` 才可能动，且**只在朝向确实相反时翻一次**
+        —— 已经是目标朝向就是恒等，所以这个动作是幂等的。默认 None 直接原样返回。
+        """
+        if self.lat_order is None or values.ndim < 2:
+            return values
+        lat = self._lat_values(source)
+        if lat is None or lat.size < 2:
+            return values
+        ascending = bool(lat[0] < lat[-1])
+        if ascending == (self.lat_order == "ascending"):
+            return values
+        return values[..., ::-1, :]
+
     def _spectra(self, batch: EvaluationBatch):
-        forecast = _values(batch.forecast)
-        observation = _values(batch.observation)
+        forecast = self._oriented(_values(batch.forecast), batch.forecast)
+        observation = self._oriented(_values(batch.observation), batch.observation)
         forecast_grid = (
             forecast.reshape(-1, forecast.shape[-1]) if forecast.ndim > 2 else forecast
         )
