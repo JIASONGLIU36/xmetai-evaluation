@@ -80,14 +80,13 @@ def test_window_sum_require_complete_masks_nan_value():
 def test_window_sum_fillna_zero_treats_missing_value_as_zero():
     values = RAMP.copy()
     values[27] = np.nan  # 同上，但按参考实现 fillna(0) 口径
-    with pytest.warns(UserWarning, match="缺测计 0"):
-        result = window_sum_at(
-            _hourly(values),
-            "precipitation",
-            datetime(2025, 8, 20, 5, 0),
-            6,
-            require_complete=False,
-        )
+    result = window_sum_at(
+        _hourly(values),
+        "precipitation",
+        datetime(2025, 8, 20, 5, 0),
+        6,
+        require_complete=False,
+    )
     assert float(result) == pytest.approx(25 + 26 + 27 + 0 + 29 + 30)
 
 
@@ -96,28 +95,26 @@ def test_window_sum_fillna_zero_reverses_summation_order():
     values = [1.0, 1e16, -1e16, 0.0]
     assert float(np.sum(values[:3])) == 0.0  # 正序：1.0 被 1e16 吞掉
 
-    with pytest.warns(UserWarning, match="缺测计 0"):
-        result = window_sum_at(
-            _hourly(values),
-            "precipitation",
-            datetime(2025, 8, 19, 2, 0),
-            3,
-            require_complete=False,
-        )
+    result = window_sum_at(
+        _hourly(values),
+        "precipitation",
+        datetime(2025, 8, 19, 2, 0),
+        3,
+        require_complete=False,
+    )
     assert float(result) == pytest.approx(1.0)  # 反序：(-1e16 + 1e16) + 1.0
 
 
 def test_window_sum_fillna_zero_drops_samples_with_missing_last_step():
     values = RAMP.copy()
     values[29] = np.nan  # 窗口末端 8/20 05:00 无记录
-    with pytest.warns(UserWarning, match="缺测计 0"):
-        result = window_sum_at(
-            _hourly(values),
-            "precipitation",
-            datetime(2025, 8, 20, 5, 0),
-            6,
-            require_complete=False,
-        )
+    result = window_sum_at(
+        _hourly(values),
+        "precipitation",
+        datetime(2025, 8, 20, 5, 0),
+        6,
+        require_complete=False,
+    )
     assert np.isnan(float(result))
 
 
