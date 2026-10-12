@@ -5,5 +5,6 @@
 - ``unit/``        纯逻辑与组件级用例（合成数据，毫秒级）
 - ``integration/`` 全链用例（合成默认跑；``realdata`` 档需环境变量指向真实数据）
 - ``conftest.py``  外层共享 fixture
-- ``runner.py``    合成数据工厂 + 评测运行器 + 产物读取（unit / integration 共用）
+- ``runner.py`` 台风合成数据工厂、运行器与产物读取
+- ``runner_weather_field.py`` 天气场（确定性/集合）合成数据工厂、运行器与产物读取
 """
