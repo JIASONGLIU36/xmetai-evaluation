@@ -7,8 +7,10 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
-import warnings
+import logging
 from datetime import datetime, timedelta
+
+log = logging.getLogger(__name__)
 
 
 def window_sum_at(
@@ -22,7 +24,7 @@ def window_sum_at(
     """取闭合窗口 [end_time - window_hours + 1h, end_time] 内的累计量。
 
     用于把逐时实况聚合到预报窗口（如 24h 累积降水），保证预报与观测口径一致。
-    窗口缺任一时次即整样本剔除；0 是有效记录，不参与缺测判定。
+    窗口缺任一时次即报错；站级缺测的处置看 require_complete；0 是有效记录，不参与缺测判定。
 
     Args:
         dataset: 含时间维的观测数据。
@@ -30,9 +32,11 @@ def window_sum_at(
         end_time: 窗口结束时刻。
         window_hours: 窗口长度（小时）。
         time_dim: 时间维度名。
-        require_complete: True 时缺任一时次即整样本剔除；
-            False 时缺测按 0 参与累计，但只保留窗口末端时次存在的样本
+        require_complete: True 时站级缺测即把该站置为缺测；
+            False 时站级缺测按 0 参与累计，但只保留窗口末端时次存在的样本
             （与参考实现 ``read_rain_obs`` 的 fillna(0) 口径一致）。
+            两种"缺"不是一回事：整时次不在观测索引里（文件缺失 / 解析失败 /
+            白名单过滤后为空）**两种口径都直接报错**，与这个开关无关。
 
     Returns:
         窗口累计值，缺失窗口为 NaN。
@@ -45,7 +49,10 @@ def window_sum_at(
     positions = available.get_indexer(np.asarray(expected, dtype="datetime64[ns]"))
     if np.any(positions < 0):
         missing = [str(expected[i]) for i, position in enumerate(positions) if position < 0]
-        raise ValueError(f"观测窗口不完整，缺少 {len(missing)} 个时次（如 {missing[:3]}）")
+        raise ValueError(
+            f"{end_time} 的 {window_hours}h 观测窗口不完整，"
+            f"缺少 {len(missing)} 个时次（如 {missing[:3]}）"
+        )
 
     values = dataset[variable].isel({time_dim: positions})
     complete = np.isfinite(values).all(dim=time_dim)
@@ -55,7 +62,18 @@ def window_sum_at(
     # 与参考实现同序累加（从有效时刻往前）：浮点求和顺序会影响恰好落在阈值上的站点，
     # 参考口径下必须同序才能逐位一致。
     ordered = values.isel({time_dim: slice(None, None, -1)})
-    warnings.warn("观测窗口按缺测计 0 累计（参考实现口径），请确认与评测协议一致")
+    # 站级缺测按 0 累计是**配置选择**（observation_window=reference），不是数据异常：
+    # 它写在配置里、也进了 manifest.json 的 resolved_config，所以这里不再对每次调用
+    # 刷警告——正式跑会按「起报 x 时效」喊几万次，把日志淹掉。只有真的把 NaN 折成 0
+    # 时留一条 DEBUG，排障时开 log_level=DEBUG 就能看到有多少个站的窗口不完整。
+    n_incomplete = int(np.count_nonzero(~complete.values))
+    if n_incomplete:
+        log.debug(
+            "%s 的 %dh 观测窗口：%d 个站的窗口内含缺测，已按 0 累计（reference 口径）",
+            end_time,
+            window_hours,
+            n_incomplete,
+        )
     return ordered.sum(dim=time_dim, skipna=True).where(present)
 
 
