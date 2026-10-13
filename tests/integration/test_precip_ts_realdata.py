@@ -70,6 +70,7 @@ def _run(output_dir: Path) -> Path:
     }
     cfg.start_date = INIT_DATE
     cfg.end_date = INIT_DATE
+    cfg.periods = None          # 生产配置已改走多时段 periods；本模块只复核单时段，必须清掉
     cfg.output_dir = str(output_dir)
     cfg.limit = None
     # 只保留全球行（丢生产配置的分纬度带），对齐口径保持北京时（offset 8）。

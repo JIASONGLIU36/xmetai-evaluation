@@ -103,6 +103,7 @@ def run_synthetic_ts_config(*, forecast_root, obs_root, output_dir) -> Path:
     }
     cfg.start_date = "20250101"
     cfg.end_date = "20250101"
+    cfg.periods = None          # 生产配置已改走多时段 periods；这里只跑单时段，必须清掉
     cfg.output_dir = str(output_dir)
     cfg.limit = None
     # 只保留全球行：丢掉生产配置的分纬度带，对齐口径保持 UTC（offset 0）。
