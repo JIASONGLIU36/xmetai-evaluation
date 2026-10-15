@@ -20,7 +20,8 @@
 | TS 系列（`weather_ts_det` / `weather_ts_ens` / `fdp_precip_ts` …） | 站点降水分类检验：TS / POD / FAR / 频率偏差 | ✅ 骨架分确定性 / 集合两份 |
 | RMSE 批次家族（`weather_rmse_single_<模型>` / `weather_rmse_ens_<模型>`，外加谱检验补充报告） | 格点 RMSE / ACC / FA / 纬向谱，**多模型横向对比** | ✅ 三份骨架 + 三个渲染器都做了（`generate_det_report.py` / `_ens_` / `_wave_`） |
 | 暴雨过程个例（`rainstorm_ts_single_<模型>`） | 2025 年 43 个暴雨过程 × **双口径**（逐日 24h / 过程累积）的站点 TS | ✅ 骨架 + 渲染器都做了（`generate_rainstorm_report.py`）。**流水线同为 `weather_ts_det`，但产物形状不同，走独立入口** |
-| 其余流程（CRPS、FSS、概率评分、台风…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
+| 台风（`weather_typhoon_det` / `weather_typhoon_ens`） | 路径、AT/CT、强度 MAE/ME、严格配对、分组 bootstrap 与固定样本 | ✅ 统计、图表、九节报告、CSV/JSON；专用入口或标准产物统一派发 |
+| 其余流程（CRPS、FSS、概率评分…） | — | ⛔ 报告模板还没做，调用时会明确报错 |
 
 **能力身份自动识别**：给一个评测产物目录，skill 从 `manifest.json` 的
 `resolved_config.pipeline` 自己认这是哪条链路再派发，**用户不用记能力名，
@@ -39,6 +40,13 @@ python skills/xmetai-evaluation/scripts/generate_report.py <产物目录> --resu
 它从 `manifest.json` 自己认出能力（TS 系列 / 连续场），派发到对应模板，出图并写 `REPORT.md`。
 认不出、或认出来但模板还没做时**明确报错**，不会静默套用另一个模板。
 更多选项见 `xmetai-evaluation/SKILL.md`。
+
+**台风报告已接通上述自动入口**，`--compare` 为 `NAME=产物目录`。高级选项走
+`scripts/generate_typhoon_report.py`。原 `.github/skills/typhoon-error-report` 已并入本 skill：
+[工作流](./xmetai-evaluation/references/typhoon-report-workflow.md)、
+[统计口径](./xmetai-evaluation/references/typhoon-verification.md) 与确定性/集合两份模板。
+两份模板均沿用其九节核心，输出统计 CSV/JSON、适用图表与 `REPORT.md`。
+输入只读、输出须新目录或空目录，不覆盖现有报告。
 
 **文档**: [`xmetai-evaluation/SKILL.md`](./xmetai-evaluation/SKILL.md)
 
@@ -87,6 +95,7 @@ skills/
     │   ├── generate_ens_report.py    # 批次归档（集合）→ 同上，另加 CRPS/Spread
     │   ├── generate_wave_report.py   # 批次归档（谱检验补充）→ 同上，另加球谐带
     │   ├── rainstorm_summary.py      # 43 个过程 × 2 口径 × N 模型 → 挑过程总表（CSV + 宽表）
+    │   ├── generate_typhoon_report.py  # 台风场次 CSV → 配对统计 + 图表 + 九节报告
     │   └── generate_rainstorm_report.py  # 暴雨过程个例产物根 → 多模型对比报告（按过程分节）
     ├── assets/
     │   └── templates/           # 报告格式契约（按能力家族一份，名字按 config 命名）
@@ -96,7 +105,7 @@ skills/
     │       ├── weather_rmse_ens.md     # RMSE 批次家族（集合）：CRPS / Spread / Spread÷RMSE
     │       ├── weather_rmse_wave.md    # 纬向 FFT + 球谐带功率谱补充分析：一份骨架
     │       ├── weather_typhoon_single.md  # 台风路径/强度（确定性）
-    │       ├── weather_typhoon_ens.md     # 台风路径/强度（集合口径 + 离散度）
+    │       ├── weather_typhoon_ens.md     # 台风路径/强度（集合平均，九节报告）
     │       └── rainstorm_case.md          # 暴雨过程个例：双口径 × 多模型，按过程分节
     ├── references/              # 参考文档（口径与判读规则）
     │   ├── evaluation-metrics.md        # 指标词典：是什么（不判好坏）
@@ -104,6 +113,8 @@ skills/
     │   ├── diagnostic-rules.md          # TS 系列判读规则
     │   ├── field-evaluation.md          # 连续场判读规则
     │   ├── rmse-batch-evaluation.md     # RMSE 批次家族（single/ens/wave）
+    │   ├── typhoon-report-workflow.md   # 台风报告工作流与验收
+    │   ├── typhoon-verification.md      # 台风字段、集合定义与统计口径
     │   └── model-diff-analysis.md       # 模型差异归因：改动起没起作用
     └── agents/                  # 空。暂无子 agent
 ```
@@ -175,6 +186,18 @@ skills/
 
 ## 维护记录
 
+- **2026-10-15（报告质量对齐）**: 保留九节大纲，台风正文按完成报告改用紧凑横表、
+  主模型/旧版本配对比较、ME 区间与数据驱动结论；完整长表与元数据留在 CSV/JSON。
+  新增主要/探索时效选项，图形配色与时效分区向参考图对齐，不改变统计口径。
+- **2026-10-15（台风执行链）**: 复用用户提供的 `typhoon_report/` 统计方法与图形布局，
+  参数化模型、目录和时效，新增主仓库统计/绘图/渲染与 skill 薄入口，接通统一派发。
+  - 支持确定性/集合平均方案 B、单/多模型、MAE/ME、严格配对、分组 bootstrap、
+    固定完整路径样本、CSV/JSON 与九节报告。
+  - 新增 `tests/unit/test_typhoon_report.py`；真实批次运行验收需在评测环境进行。
+- **2026-10-15**: 将 `.github/skills/typhoon-error-report` 并入 `xmetai-evaluation`。
+  - 确定性/集合台风模板对齐其九节核心，保留原模板的表头、占位符与复现/验收结构。
+  - 工作流和统计参考迁入 `references/`，补充当前 writer 与历史归档的字段区别。
+  - 通用台风渲染器仍未实现；未改变 TS/RMSE 口径或新增运行脚本。
 - **2026-09-09**: 初始版本
   - 创建 xmetai-evaluation skill
   - 实现降水评估功能

@@ -10,7 +10,7 @@
     --model NAME    报告标题里的模型名（默认取 manifest 的 run_id）
     --change TEXT   本次改动说明，写进报告第一节
     --compare 名字=CSV路径
-                    对比模型的宽表，可重复；只在 TS 系列上有意义。
+                    TS 对比模型的宽表，可重复。台风则用 名字=产物目录。
                     对比模型给的是**宽表**不是产物目录——它们没有 manifest。
                     evaluation_results/ 下一个模型一个目录，宽表都在
                     diagnostics/categorical_wide.csv。三个模式一起比：
@@ -57,10 +57,14 @@ def main(argv=None) -> int:
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 manifest.json 与结果表）")
     parser.add_argument("--result", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
     parser.add_argument("--model", default=None, help="模型名（默认取 manifest 的 run_id）")
+    parser.add_argument("--primary-model", help="台风分析主模型")
+    parser.add_argument("--previous-model", help="台风主模型的旧版本显示名")
+    parser.add_argument("--primary-leads", type=float, nargs="+", help="台风主要讨论时效")
+    parser.add_argument("--exploratory-leads", type=float, nargs="+", help="台风探索性讨论时效")
     parser.add_argument("--change", default=None, help="本次改动说明，写进报告第一节")
     parser.add_argument(
         "--compare", action="append", default=None, metavar="名字=CSV路径",
-        help="对比模型的宽表（可重复），只在 TS 系列上有意义",
+        help="可重复：TS 为 NAME=宽表CSV；台风为 NAME=产物目录",
     )
     parser.add_argument(
         "--spectrum-variable", default=None,
@@ -90,6 +94,8 @@ def main(argv=None) -> int:
         change_description=args.change,
         compare=args.compare,
         members=args.members,
+        primary_model=args.primary_model, previous_model=args.previous_model,
+        primary_leads=args.primary_leads, exploratory_leads=args.exploratory_leads,
     )
     print(f"\n产出 {len(artifacts)} 个文件：")
     for name, path in artifacts.items():

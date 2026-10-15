@@ -19,9 +19,9 @@
 拿错模板比报错危险得多。
 
 能力先归到**报告家族**（``IMPLEMENTED`` 的值），再按家族派发：同一家族的流程
-写出的产物表结构相同，共用一套模板与图表。目前两个家族——``field``
+写出的产物表结构相同，共用一套模板与图表。目前三个家族——``field``
 （连续场，吃 ``scores.csv``）与 ``ts``（降水分类检验，吃
-``diagnostics/categorical_wide.csv``）。
+``diagnostics/categorical_wide.csv``），``typhoon`` 吃场次曲线与元数据。
 """
 
 from __future__ import annotations
@@ -41,12 +41,15 @@ IMPLEMENTED: Dict[str, str] = {
     "weather_ts_det": "ts",
     "weather_ts_ens": "ts",
     "fdp_precip_ts": "ts",
+    "weather_typhoon_det": "typhoon",
+    "weather_typhoon_ens": "typhoon",
 }
 
 #: 家族 -> 一句话说明，只用于日志与报错信息。
 FAMILY_LABELS: Dict[str, str] = {
     "field": "确定性连续场检验（RMSE / ACC / 活跃度 / 纬向谱）",
     "ts": "站点降水分类检验（TS / POD / FAR / 频率偏差）",
+    "typhoon": "台风路径、分量与强度误差（逐指标逐时效严格配对）",
 }
 
 #: 退路判据 ``(流程名, protocol_id, 指标名集合)``，只在 manifest 里没有
@@ -159,6 +162,10 @@ def build_report(
     change_description: Optional[str] = None,
     compare: Optional[Sequence[str]] = None,
     members: Optional[int] = None,
+    primary_model: Optional[str] = None,
+    previous_model: Optional[str] = None,
+    primary_leads: Optional[Sequence[float]] = None,
+    exploratory_leads: Optional[Sequence[float]] = None,
 ) -> Dict[str, Path]:
     """按产物目录里的能力出图并写报告，返回 ``{名称: 路径}``。
 
@@ -170,7 +177,8 @@ def build_report(
         model_name: 报告标题里的模型名；默认取 ``run_id``。**不要用 manifest 的
             ``forecast_source``**——那是 reader 类型（如 ``"fuxi"``），不是模型名，
             拿它当标题会张冠李戴。
-        compare: 对比模型，``["名字=CSV路径", …]``，只在 TS 系列上有意义。
+        compare: TS 对比模型为 ``["名字=CSV路径", …]``；
+            台风对比模型为 ``["名字=产物目录", …]``，读取目录中的场次曲线与元数据。
             给出来的模型会和主模型一起进箱线图、差值图和对比表。每个对比路径还会
             去**它的同目录**找概率评分表——``probability_wide.csv`` 与老命名的
             ``aroc_bss*.csv`` 都认（见 :func:`_probability_sibling`）；找得到就
@@ -193,6 +201,33 @@ def build_report(
     info = manifest_info_from(load_manifest(output_dir))
     target = Path(out_dir) if out_dir is not None else _default_output_dir(output_dir, info)
     full_model_name = model_name or str(info.get("run_id") or output_dir.name)
+
+    if family == "typhoon":
+        from xmetai_evaluation.visualization.typhoon_report import (
+            build_typhoon_report,
+        )
+
+        if any(value is not None for value in (
+            spectrum_variable, spectrum_init, change_description, members
+        )):
+            raise ValueError("台风入口不接受谱、改动说明或成员数覆盖；成员数读取实际产物")
+        models = [(full_model_name, output_dir)]
+        for value in compare or []:
+            name, separator, path = value.partition("=")
+            if not separator or not name.strip() or not path.strip():
+                raise ValueError("台风 --compare 必须为 NAME=产物目录")
+            models.append((name.strip(), Path(path.strip())))
+        expected = "ens" if capability == "weather_typhoon_ens" else "det"
+        return build_typhoon_report(
+            models, target, forecast_type=expected, primary_model=primary_model,
+            previous_model=previous_model, primary_leads=primary_leads,
+            exploratory_leads=exploratory_leads,
+        )
+
+    if any(value is not None for value in (
+        primary_model, previous_model, primary_leads, exploratory_leads
+    )):
+        raise ValueError("主模型/旧版本/讨论时效选项只适用于台风报告")
 
     # 先把 compare 校验干净再往下走：任何错误都必须在 create_report 建目录之前抛出来，
     # 否则会留下一个只有半张图的空报告目录。
@@ -377,6 +412,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("output_dir", type=Path, help="评测产物目录（含 scores.csv 与 manifest.json）")
     parser.add_argument("--result", type=Path, default=None, help="报告输出目录（默认 reports/<run_id>）")
     parser.add_argument("--model", default=None, help="模型名（默认取 manifest 的 run_id）")
+    parser.add_argument("--primary-model", help="台风分析主模型")
+    parser.add_argument("--previous-model", help="台风主模型的旧版本显示名")
+    parser.add_argument("--primary-leads", type=float, nargs="+", help="台风主要讨论时效")
+    parser.add_argument("--exploratory-leads", type=float, nargs="+", help="台风探索性讨论时效")
     parser.add_argument(
         "--spectrum-variable", default=None, help="要看谱曲线的变量（需变量真的算过纬向谱）"
     )
@@ -392,8 +431,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--compare", action="append", default=None, metavar="名字=CSV路径",
-        help="对比模型的结果表（可重复），只在 TS 系列上有意义；"
-        "给了就一起进箱线图、差值图与对比表",
+        help="可重复：TS 为 NAME=宽表CSV；台风为 NAME=产物目录",
     )
     args = parser.parse_args(argv)
 
@@ -406,6 +444,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         change_description=args.change,
         compare=args.compare,
         members=args.members,
+        primary_model=args.primary_model, previous_model=args.previous_model,
+        primary_leads=args.primary_leads, exploratory_leads=args.exploratory_leads,
     )
     for name, path in artifacts.items():
         print(f"  {name}: {path}")

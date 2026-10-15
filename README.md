@@ -35,6 +35,31 @@ python -m xmetai_evaluation.cli --config weather_rmse_single_fgvp --log-file /wo
 python -m pytest tests/integration/test_fdp_fengqing_realdata.py -m realdata
 ```
 
+## 台风结果生成报告
+
+evaluation 写出的逐场次 CSV 与元数据可直接生成严格配对统计、图表与九节报告：
+
+```bash
+python skills/xmetai-evaluation/scripts/generate_typhoon_report.py \
+  --model "FGVP=evaluation_results/weather_typhoon_ens_fgvp" \
+  --model "FuXi=evaluation_results/weather_typhoon_ens_fuxi" \
+  --result reports/typhoon_ens \
+  --leads 24 48 72 96 120 --fixed-leads 24 48 72 96 120
+```
+
+单模型仅给一个 `--model`；确定性与集合分别生成。时效不指定则使用真实数据；
+默认 2000 次台风区组 bootstrap，`--bootstrap 0` 禁用。输入可为标准产物根或
+场次 CSV 目录，要求每个场次有类型、时间和集合口径明确的 `_meta.json`。
+输出 `REPORT.md`、`summary.json`、`statistics.csv`、`differences.csv`、
+`track.png` 和适用时的 `mae.png` / `me.png`。不改写输入，不覆盖非空输出目录。
+集合主结果是方案 B，不是成员平均误差或概率性能。
+具体输入契约与验收见 [台风报告工作流](./skills/xmetai-evaluation/references/typhoon-report-workflow.md)。
+报告保留九节大纲，正文采用模型×时效横表与数据驱动小结，完整统计留在 CSV/JSON。
+可用 `--primary-model` / `--previous-model` 明确主模型与旧版本，
+`--primary-leads` / `--exploratory-leads` 预先指定主要/探索时效；
+其他时效作个例参考。配对差值正文按“比较模型 − 主模型”展示，
+均值下降不自动代表稳定改进。
+
 ## 目录结构
 
 ```text
@@ -968,4 +993,3 @@ observation_reader={
 - **新增指标**：在 `metrics/` 实现 `Metric`（`accumulate` / `merge` / `finalize`），到 `components.py` 注册。
 - **新增流程**：在 `pipeline/pipelines.py` 加一个 `PipelineTemplate`。
 - **新增数据源/算法** = 加注册项；**新增评测** = 加配置，代码不动。
-
