@@ -32,7 +32,7 @@ import numpy as np
 import xarray as xr
 
 from xmetai_evaluation.core.contracts import DataIndex, DataRequest, EvaluationBatch
-from xmetai_evaluation.core.errors import ConfigError
+from xmetai_evaluation.core.errors import ConfigError, TyphoonDataError
 from xmetai_evaluation.pipeline.matcher import (
     Matcher,
     add_derived_variables,
@@ -40,7 +40,6 @@ from xmetai_evaluation.pipeline.matcher import (
     align_to_grid,
 )
 from xmetai_evaluation.pipeline.spec import PipelineSpec, hourly_times
-from xmetai_evaluation.pipeline.typhoon import diagnose_track, match_errors
 from xmetai_evaluation.transforms.temporal import window_sum_at
 
 log = logging.getLogger(__name__)
@@ -1171,6 +1170,126 @@ class GridValidTimeProtocol(Protocol):
         return summary
 
 
+# ---------------------------------------------------------------- 台风诊断
+
+def _box_mask(glat, glon, clat, clon, half_lat, half_lon):
+    """以 (clat, clon) 为中心的经纬方框掩膜（经度回绕）。"""
+    glat = np.asarray(glat, dtype="f8")
+    glon = np.mod(np.asarray(glon, dtype="f8"), 360.0)
+    m_lat = np.abs(glat - clat) <= half_lat
+    dlon = np.mod(glon - (clon % 360.0) + 180.0, 360.0) - 180.0
+    m_lon = np.abs(dlon) <= half_lon
+    return m_lat[:, None] & m_lon[None, :]
+
+
+def find_center_by_slp(msl, glat, glon, clat, clon, half_lat, half_lon):
+    """方框内 msl 最小值点为台风中心。返回 (lat, lon, pmin)。"""
+    m = _box_mask(glat, glon, clat, clon, half_lat, half_lon)
+    if not m.any():
+        raise TyphoonDataError(
+            "搜索框 (%g,%g)±(%g,%g) 越出网格" % (clat, clon, half_lat, half_lon)
+        )
+    idx = np.nanargmin(np.where(m, msl, np.nan))
+    i, j = np.unravel_index(idx, m.shape)
+    return float(glat[i]), float(glon[j]), float(msl[i, j])
+
+
+def max_wind_in_box(wind, glat, glon, clat, clon, half_lat, half_lon):
+    """方框内风速最大值（强度，参考口径：±5° 方框最大 10m 风）。"""
+    m = _box_mask(glat, glon, clat, clon, half_lat, half_lon)
+    return float(np.nanmax(wind[m]))
+
+
+def diagnose_track(
+    msl,
+    glat,
+    glon,
+    init_lat,
+    init_lon,
+    leads_hours,
+    wind=None,
+    center_half=3.0,
+    early_half=4.0,
+    early_hours=12.0,
+    intensity_half=5.0,
+):
+    """从实况初始位置起链式诊断台风中心与强度。
+
+    msl: (T, lat, lon) Pa；wind: 同形风速(m/s) 或 None；
+    leads_hours: (T,) 各时次的真实时效（小时）；
+    前 early_hours 小时用 early_half 搜索框（防初期漂移），其后 center_half；
+    强度框以**当前诊断中心**为中心（±intensity_half）。
+
+    返回 dict of list: lat, lon, pmin_hpa, vmax(无风场为 nan)。
+
+    **链式**：每一时次的搜索框中心是上一时次诊断出的中心，不是实况位置——
+    所以同一段场按不同起点切进来会得到不同结果，时效序列必须完整。
+    """
+    T = msl.shape[0]
+    out = {"lat": [], "lon": [], "pmin_hpa": [], "vmax": []}
+    plat, plon = float(init_lat), float(init_lon)
+    for k in range(T):
+        half = early_half if leads_hours[k] < early_hours else center_half
+        lat_c, lon_c, pmin = find_center_by_slp(msl[k], glat, glon, plat, plon, half, half)
+        if wind is not None:
+            vmax = max_wind_in_box(wind[k], glat, glon, lat_c, lon_c, intensity_half, intensity_half)
+        else:
+            vmax = float("nan")
+        out["lat"].append(lat_c)
+        out["lon"].append(lon_c)
+        out["pmin_hpa"].append(pmin / 100.0)
+        out["vmax"].append(vmax)
+        plat, plon = lat_c, lon_c
+    return out
+
+
+def pair_observations(
+    track: Dict[str, List[float]],
+    leads_hours: Sequence[float],
+    init_utc: datetime,
+    babj: Dict[datetime, Dict[str, float]],
+    tz_shift: float = 8.0,
+) -> List[Dict[str, Any]]:
+    """把诊断路径与 BABJ 实况逐时效配对，只填预报/实况列。
+
+    误差由 :mod:`xmetai_evaluation.metrics.track_error` 计算；这里返回的行
+    保留旧的 15 列结构（误差列留 NaN），但协议不再算分。验证时刻(北京时) =
+    ``init_utc + 时效 + tz_shift``；无实况记录的时效各项为 NaN。
+    """
+    rows: List[Dict[str, Any]] = []
+    for k, tau in enumerate(leads_hours):
+        v_bjt = init_utc + timedelta(hours=float(tau) + tz_shift)
+        ob = babj.get(v_bjt)
+        f_lat, f_lon = track["lat"][k], track["lon"][k]
+        f_p, f_v = track["pmin_hpa"][k], track["vmax"][k]
+        row = {
+            "lead_h": float(tau),
+            "valid_bjt": str(v_bjt),
+            "fcst_lat": f_lat,
+            "fcst_lon": f_lon,
+            "fcst_pmin_hpa": f_p,
+            "fcst_vmax_ms": f_v,
+            "obs_lat": np.nan,
+            "obs_lon": np.nan,
+            "obs_pmin_hpa": np.nan,
+            "obs_vmax_ms": np.nan,
+            "track_err_km": np.nan,
+            "at_km": np.nan,
+            "ct_km": np.nan,
+            "wind_err_ms": np.nan,
+            "pmin_err_hpa": np.nan,
+        }
+        if ob is not None:
+            row.update(
+                obs_lat=ob["lat"],
+                obs_lon=ob["lon"],
+                obs_pmin_hpa=ob["pmin_hpa"],
+                obs_vmax_ms=ob["vmax_ms"],
+            )
+        rows.append(row)
+    return rows
+
+
 class TyphoonTrackProtocol(Protocol):
     """台风路径与强度检验：从全球场链式诊断中心，对 BABJ 报文配对。
 
@@ -1179,7 +1298,7 @@ class TyphoonTrackProtocol(Protocol):
     - **预报侧**：整段时效的 MSL 场（+ u10/v10 派生的风速），从**起报后第一条
       不早于「起报 + ``seed_min_offset_hours``」的实况位置**起步（默认 6h，见
       ``babj_seed_moment``），逐时效在方框里搜最低气压中心，下一时效的搜索框
-      中心是这一时效的诊断结果（链式，见 ``pipeline/typhoon.py``）；
+      中心是这一时效的诊断结果（链式，见本模块的 ``diagnose_track``）；
     - **观测侧**：BABJ 报文里 ``起报时刻 + 时效 + tz_shift``（北京时）的实况；
     - **样本单位**：``storm``。
 
@@ -1367,7 +1486,9 @@ class TyphoonTrackProtocol(Protocol):
             early_hours=self.early_hours,
             intensity_half=self.intensity_half,
         )
-        return match_errors(track, leads, init_time, analyses, tz_shift=self.tz_shift)
+        return pair_observations(
+            track, leads, init_time, analyses, tz_shift=self.tz_shift
+        )
 
     def _diagnose_all(self, init_times: List[datetime], lead_times: List[float]) -> None:
         """逐 (起报, 台风) 链式诊断 + 配对，把结果打包成批次。"""
@@ -1436,8 +1557,8 @@ class TyphoonTrackProtocol(Protocol):
     def _storm_analyses(self, index: int) -> Dict[datetime, Dict[str, float]]:
         """把第 index 号台风的实况列拆成 ``{北京时: {lat, lon, pmin_hpa, vmax_ms}}``。
 
-        形状与旧链路的 ``read_babj_analyses`` 返回值一致——``match_errors``
-        直接吃这个字典。
+        形状与 :func:`xmetai_evaluation.io.babj_reader.read_babj_analyses`
+        的返回值一致——``pair_observations`` 直接吃这个字典。
         """
         lat = self.babj["lat"].values[:, index]
         analyses: Dict[datetime, Dict[str, float]] = {}

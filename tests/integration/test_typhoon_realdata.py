@@ -255,7 +255,7 @@ def test_real_ens_parity_20250610(tmp_path):
     )
 
     # B 类：成员位置先平均、再与实况求误差
-    from xmetai_evaluation.pipeline.typhoon import along_cross_track, great_circle_km
+    from xmetai_evaluation.metrics.track_error import along_cross_track, great_circle_km
 
     obs_lat_arr = obs_lat.to_numpy(dtype=float)
     obs_lon_arr = obs_lon.to_numpy(dtype=float)
@@ -271,7 +271,7 @@ def test_real_ens_parity_20250610(tmp_path):
     )
 
     # 首时次 anchor = 起报时刻实况（用真报文独立取，08:00 北京时）
-    from xmetai_evaluation.pipeline.typhoon import read_babj_analyses
+    from xmetai_evaluation.io.babj_reader import read_babj_analyses
 
     _, _, analyses = read_babj_analyses(babj_dir / "babj2501.dat")
     anchor = analyses[datetime(2025, 6, 10, 8, 0)]

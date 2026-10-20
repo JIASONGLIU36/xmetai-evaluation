@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""pipeline/typhoon.py：报文解析 / 几何 / 链式诊断 / 配对（合成数据）。"""
+"""台风算法按层拆分后的单元测试（合成数据）。
+
+- 报文解析：``io/babj_reader.py``
+- 几何 / 误差 / 旧配对入口：``metrics/track_error.py``
+- 中心诊断 / 只做配对的 ``pair_observations``：``pipeline/protocols.py``
+"""
 import math
 from datetime import datetime, timedelta
 
@@ -7,15 +12,17 @@ import numpy as np
 import pytest
 
 from tests.runner import GRID_LAT, GRID_LON, KM_PER_DEG, gaussian_msl
-from xmetai_evaluation.core.errors import DecodeError
-from xmetai_evaluation.pipeline.typhoon import (
-    TyphoonDataError,
+from xmetai_evaluation.core.errors import DecodeError, TyphoonDataError
+from xmetai_evaluation.io.babj_reader import read_babj_analyses
+from xmetai_evaluation.metrics.track_error import (
     along_cross_track,
-    diagnose_track,
-    find_center_by_slp,
     great_circle_km,
     match_errors,
-    read_babj_analyses,
+)
+from xmetai_evaluation.pipeline.protocols import (
+    diagnose_track,
+    find_center_by_slp,
+    pair_observations,
 )
 
 
@@ -190,3 +197,20 @@ def test_match_errors_wind_nan_when_forecast_wind_missing():
     row = match_errors(track, [6.0], init, babj)[0]
     assert math.isnan(row["wind_err_ms"])
     assert row["pmin_err_hpa"] == pytest.approx(-10.0)
+
+
+def test_pair_observations_only_pairs_without_computing_errors():
+    """协议只做配对：预报/实况列填上，误差列统一留空。"""
+    init = datetime(2025, 6, 10, 0, 0)
+    babj = {
+        datetime(2025, 6, 10, 14, 0): {"lon": 121.0, "lat": 20.0, "pmin_hpa": 960.0, "vmax_ms": 25.0}
+    }
+    track = _track([20.25, 20.75], [121.0, 121.0], [950.0, 949.0], [30.0, 30.0])
+    rows = pair_observations(track, [6.0, 12.0], init, babj)
+    first, gap = rows
+    assert first["fcst_lat"] == pytest.approx(20.25)
+    assert first["obs_lat"] == pytest.approx(20.0)
+    assert first["obs_pmin_hpa"] == pytest.approx(960.0)
+    for field in ("track_err_km", "at_km", "ct_km", "wind_err_ms", "pmin_err_hpa"):
+        assert math.isnan(first[field])
+    assert math.isnan(gap["obs_lat"]) and math.isnan(gap["obs_lon"])

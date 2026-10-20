@@ -2,7 +2,12 @@
 """BABJ 台风路径报文 Reader。
 
 一个 ``babj<编号>.dat`` 文件 = 一号台风的**整条路径**（diamond7、GBK 编码、
-空白分隔），格式与解析口径见 ``pipeline/typhoon.py`` 的模块 docstring。
+空白分隔）。报文格式：
+
+  第 1 行 diamond 7 头；第 2 行 台风名 编号 …；第 3 行空；
+  数据行  yy mm dd hh 时效 lon lat 中心气压 最大风速(m/s) …
+  **时效列 = 000 的行是分析实况**，其余为 BABJ 主观预报（不用）。
+  时间为**北京时**（UTC 预报需 +8h 对时）。
 
 与其它观测源的关键差别，也是本 Reader 不按时间筛文件的原因：
 
@@ -23,7 +28,7 @@
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import xarray as xr
@@ -36,12 +41,42 @@ from xmetai_evaluation.core.contracts import (
     Provenance,
     SemanticMetadata,
 )
-from xmetai_evaluation.core.errors import DiscoveryError
+from xmetai_evaluation.core.errors import DecodeError, DiscoveryError, TyphoonDataError
 from xmetai_evaluation.core.variables import TemporalKind
 from xmetai_evaluation.io.base import DataCatalog, Reader
-from xmetai_evaluation.pipeline.typhoon import read_babj_analyses
 
 log = logging.getLogger(__name__)
+
+
+def read_babj_analyses(path) -> Tuple[str, str, Dict[datetime, Dict[str, float]]]:
+    """读 babj diamond7，只取时效 000 的实况记录。
+
+    返回 ``(tcname, tcid, {北京时datetime: dict(lon, lat, pmin_hpa, vmax_ms)})``。
+
+    列序是 **lon 在前、lat 在后**（第 6、7 列），别按经纬顺序读反。
+    """
+    try:
+        with open(path, "rb") as f:
+            f.readline()
+            head = f.readline().decode("gbk", "ignore").split()
+        tcname, tcid = head[0], head[1]
+        rows = np.loadtxt(path, skiprows=3, encoding="gbk", ndmin=2)
+    except (OSError, ValueError, IndexError) as e:
+        raise DecodeError("解析 babj 报文 %s 失败: %s" % (path, e)) from e
+    analyses: Dict[datetime, Dict[str, float]] = {}
+    for r in rows:
+        if int(round(r[4])) != 0:  # 只要实况行
+            continue
+        t = datetime(int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+        analyses[t] = {
+            "lon": float(r[5]),
+            "lat": float(r[6]),
+            "pmin_hpa": float(r[7]),
+            "vmax_ms": float(r[8]),
+        }
+    if not analyses:
+        raise TyphoonDataError("%s 中没有时效 000 的实况记录" % path)
+    return tcname, tcid, analyses
 
 
 class BabjCatalog(DataCatalog):

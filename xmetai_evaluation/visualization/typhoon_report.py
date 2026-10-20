@@ -82,7 +82,7 @@ def _number(value: object, context: str) -> Optional[float]:
 
 def _legacy_member_evidence(path: Path, init: datetime, offset: float, meta: dict) -> dict:
     """Read-only audit: prove the stored legacy distances are scheme B, not scheme A."""
-    from xmetai_evaluation.pipeline.typhoon import along_cross_track, great_circle_km
+    from xmetai_evaluation.metrics.track_error import along_cross_track, great_circle_km
 
     member_path = path.with_name(path.stem.removesuffix("_ensemble") + "_members.csv")
     if not member_path.is_file():

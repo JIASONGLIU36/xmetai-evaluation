@@ -7,8 +7,8 @@
 - ``observation``：配对上的实况中心（同上四项；对不上的时效为 NaN）。
 
 **协议只管配对，误差在这里算**：大圆距离、沿/横路径分解、强度偏差。逐时效
-走标量循环（与 ``pipeline/typhoon.py`` 里 ``match_errors`` 同一套调用），
-不向量化——归档对拍要的是逐位一致，不是"数学上等价"。
+走标量循环（与本模块的 ``match_errors`` 同一套调用），不向量化——归档对拍
+要的是逐位一致，不是"数学上等价"。
 
 沿/横路径误差（``at_km`` / ``ct_km``）的定向用**前一个配对上的实况位置**，
 不是预报-实况连线，也不是起报点；所以确定性链里**第一个配对时效**的 at/ct
@@ -22,7 +22,9 @@
 × 全年场次会把长表撑成几十万行，而曲线本来就有专门的出口。
 """
 
-from typing import Any, Dict, List
+import datetime as _dt
+import math
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 import xarray as xr
@@ -35,7 +37,116 @@ from xmetai_evaluation.metrics.base import (
     MetricState,
     ProductType,
 )
-from xmetai_evaluation.pipeline.typhoon import along_cross_track, great_circle_km
+
+#: 大圆距离用的地球半径（km），与旧链路一致。
+R_EARTH_KM = 6371.0
+
+
+def great_circle_km(lat1, lon1, lat2, lon2):
+    """球面大圆距离（km，r=6371）。向量化；近距用 haversine 保精度。"""
+    lat1, lon1, lat2, lon2 = (
+        np.deg2rad(np.asarray(x, dtype="f8")) for x in (lat1, lon1, lat2, lon2)
+    )
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 2 * R_EARTH_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+def along_cross_track(lat0, lon0, lat_b, lon_b, lat_p, lon_p):
+    """沿路径(at)/横路径(ct)误差分解（参考脚本公式，km）。
+
+    ``(lat0,lon0)`` 是**前一个配对实况**位置，``(lat_b,lon_b)`` 是当前实况、
+    ``(lat_p,lon_p)`` 是当前预报——方向由实况路径段定，不是预报-实况连线。
+    """
+    def _alpha(la0, lo0, la, lo):
+        dlat = (la - la0) / 180.0 * math.pi
+        dlon = (lo - lo0) / 180.0 * math.pi
+        return math.atan2(dlon * math.cos((la + la0) / 2 / 180 * math.pi), dlat)
+
+    dalpha = _alpha(lat0, lon0, lat_p, lon_p) - _alpha(lat0, lon0, lat_b, lon_b)
+    len_b = float(great_circle_km(lat0, lon0, lat_b, lon_b))
+    len_p = float(great_circle_km(lat0, lon0, lat_p, lon_p))
+    ct = len_p * math.sin(dalpha)
+    at = len_p * math.cos(dalpha) - len_b
+    return at, ct
+
+
+def match_errors(
+    track: Dict[str, List[float]],
+    leads_hours: Sequence[float],
+    init_utc: _dt.datetime,
+    babj: Dict[_dt.datetime, Dict[str, float]],
+    tz_shift: float = 8.0,
+) -> List[Dict[str, float]]:
+    """诊断路径对 babj 实况逐时效配对并计算误差（旧链路兼容入口）。
+
+    ``track`` 是 ``diagnose_track`` 的输出；``babj`` 是
+    ``read_babj_analyses`` 的字典（北京时）。验证时刻(北京时) =
+    ``init_utc + 时效 + tz_shift``。无实况记录的时效各项为 NaN（路径/强度
+    误差保持 NaN，不外推）。
+
+    首个**配对成功**的时效 ``at_km``/``ct_km`` 为空——没有前一个实况位置就
+    无从定向；实况有缺口时，缺的是那个时效，不是固定 ``lead_h=6``。
+
+    生产链路由协议先做 ``pair_observations``、指标再从批次算误差；这个函数
+    保留给旧归档对拍与回归测试，调用顺序与旧实现一致。
+    """
+    prev_babj = None
+    rows: List[Dict[str, float]] = []
+    for k, tau in enumerate(leads_hours):
+        v_bjt = init_utc + _dt.timedelta(hours=float(tau) + tz_shift)
+        ob = babj.get(v_bjt)
+        f_lat, f_lon = track["lat"][k], track["lon"][k]
+        f_p, f_v = track["pmin_hpa"][k], track["vmax"][k]
+        if ob is None:
+            rows.append(
+                {
+                    "lead_h": float(tau),
+                    "valid_bjt": str(v_bjt),
+                    "fcst_lat": f_lat,
+                    "fcst_lon": f_lon,
+                    "fcst_pmin_hpa": f_p,
+                    "fcst_vmax_ms": f_v,
+                    "obs_lat": np.nan,
+                    "obs_lon": np.nan,
+                    "obs_pmin_hpa": np.nan,
+                    "obs_vmax_ms": np.nan,
+                    "track_err_km": np.nan,
+                    "at_km": np.nan,
+                    "ct_km": np.nan,
+                    "wind_err_ms": np.nan,
+                    "pmin_err_hpa": np.nan,
+                }
+            )
+            continue
+        o_lat, o_lon = ob["lat"], ob["lon"]
+        err = float(great_circle_km(f_lat, f_lon, o_lat, o_lon))
+        if prev_babj is None:  # 首个配对时次
+            at = ct = float("nan")
+        else:
+            at, ct = along_cross_track(prev_babj[0], prev_babj[1], o_lat, o_lon, f_lat, f_lon)
+        rows.append(
+            {
+                "lead_h": float(tau),
+                "valid_bjt": str(v_bjt),
+                "fcst_lat": f_lat,
+                "fcst_lon": f_lon,
+                "fcst_pmin_hpa": f_p,
+                "fcst_vmax_ms": f_v,
+                "obs_lat": o_lat,
+                "obs_lon": o_lon,
+                "obs_pmin_hpa": ob["pmin_hpa"],
+                "obs_vmax_ms": ob["vmax_ms"],
+                "track_err_km": err,
+                "at_km": at,
+                "ct_km": ct,
+                "wind_err_ms": f_v - ob["vmax_ms"] if np.isfinite(f_v) else float("nan"),
+                "pmin_err_hpa": f_p - ob["pmin_hpa"],
+            }
+        )
+        prev_babj = (o_lat, o_lon)
+    return rows
+
 
 #: 逐时效表里的字段（顺序即写盘顺序，与旧归档的 csv 列一致）
 CURVE_FIELDS = (

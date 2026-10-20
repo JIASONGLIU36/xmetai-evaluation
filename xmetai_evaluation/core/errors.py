@@ -101,6 +101,12 @@ class AlignmentError(EvaluationError):
     pass
 
 
+class TyphoonDataError(EvaluationError):
+    """台风数据/匹配问题：报文缺实况、搜索框越出网格等。"""
+
+    pass
+
+
 class MetricError(EvaluationError):
     """指标错误：零分母、参数非法、公式无法计算
 
